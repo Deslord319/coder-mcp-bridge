@@ -2,6 +2,9 @@
 
 > 把 **ZCode** 作为完整的智能体(agent)暴露给任意 MCP 客户端 —— 在 Claude Code、Codex、Cursor 或 ZCode 自身里,通过两个工具把复杂编码任务委托给一个独立的 ZCode 智能体去执行。
 
+> [!WARNING]
+> **当前默认权限模式是 `yolo`。** 如果调用时没有显式传入 `mode` 或 `sandbox`,ZCode 会自动批准工具调用,包括修改文件和执行 shell 命令。处理不可信提示词、重要仓库或生产环境时,请显式使用 `mode: "plan"` 或 `sandbox: "read-only"`;确认方案后再按需切换到 `build` / `workspace-write`。只有在明确接受完全访问风险时才使用 `yolo` / `danger-full-access`。
+
 本实现**对齐 Codex 官方 `mcp-server`**(`codex mcp-server` 会暴露 `codex` / `codex-reply` 两个工具),本项目提供与之等价的:
 
 | Codex mcp-server | ZCode MCP Bridge | 作用 |
@@ -147,6 +150,12 @@ args = ["/path/to/zcode-mcp-plugin/server.py"]
 { "name": "zcode-reply", "arguments": { "threadId": "sess_...", "prompt": "给刚才的实现补一段 README" } }
 ```
 
+只做分析、不允许修改文件或执行高风险操作时,建议从只读模式开始:
+
+```json
+{ "name": "zcode", "arguments": { "prompt": "分析当前项目并给出修改方案", "cwd": "/path/to/project", "sandbox": "read-only" } }
+```
+
 ## 工具参数
 
 ### `zcode` — 运行 ZCode 会话
@@ -219,7 +228,7 @@ python3 tests/test_stress.py --concurrency 6 --stability 5 --turns 5
 
 ## 安全提示
 
-- 服务器把 `prompt` 原样传给 ZCode 无界面 CLI,默认 `--mode yolo`(自动批准全部工具)。生产环境请显式传 `mode: "plan"` 或 `sandbox: "read-only"`,或通过 `disallowedTools` 收紧工具集。
+- 服务器把 `prompt` 原样传给 ZCode 无界面 CLI;未指定 `mode` / `sandbox` 时默认使用 `--mode yolo`(自动批准全部工具)。生产环境请显式传 `mode: "plan"` 或 `sandbox: "read-only"`,或通过 `disallowedTools` 收紧工具集。
 - 服务器不校验 / 不透传 shell 命令;权限模型完全由 ZCode 的 mode 控制。
 - 不要把包含 API 密钥的配置提交到版本库。
 
