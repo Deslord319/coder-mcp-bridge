@@ -208,6 +208,10 @@ python3 tests/test_stress.py --concurrency 6 --stability 5 --turns 5
 - 服务器不校验 / 不透传 shell 命令;权限模型完全由 ZCode 的 mode 控制。
 - 不要把包含 API 密钥的配置提交到版本库。
 
+## 友情链接
+
+- [Linux.do](https://linux.do/) —— 一个面向开发者和技术爱好者的社区
+
 ## 许可证
 
 MIT
