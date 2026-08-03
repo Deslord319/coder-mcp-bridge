@@ -145,6 +145,11 @@ def test_handshake(c):
     zcode_schema = next((t for t in tools if t["name"] == "zcode"), {})
     check("zcode inputSchema requires prompt",
           "prompt" in zcode_schema.get("inputSchema", {}).get("required", []), tools)
+    check("zcode inputSchema has no model override",
+          "model" not in zcode_schema.get("inputSchema", {}).get("properties", {}), tools)
+    reply_schema = next((t for t in tools if t["name"] == "zcode-reply"), {})
+    check("zcode-reply inputSchema has no model override",
+          "model" not in reply_schema.get("inputSchema", {}).get("properties", {}), tools)
     return tools
 
 

@@ -164,7 +164,6 @@ args = ["/path/to/zcode-mcp-plugin/server.py"]
 |---|---|---|
 | `prompt` *(必填)* | 字符串 | 初始用户提示词 |
 | `threadId` | 字符串 | 已有会话 ID(`sess_...`)用于续接;不填则新建会话 |
-| `model` | 字符串 | 模型覆盖(如 `deepseek/deepseek-v4-flash`),通过环境变量 `ZCODE_MODEL` 传递 |
 | `cwd` | 字符串 | 工作目录(映射 `--cwd`) |
 | `sandbox` | 字符串 | `read-only`→plan、`workspace-write`→build、`danger-full-access`→yolo |
 | `mode` | 字符串 | ZCode 权限模式:build / edit / plan / yolo(默认 yolo) |
@@ -176,6 +175,10 @@ args = ["/path/to/zcode-mcp-plugin/server.py"]
 ### `zcode-reply` — 继续会话
 
 参数:`threadId`(必填)+ `prompt`(必填),其余同上。
+
+模型不通过 MCP 调用参数覆盖。桥接器始终使用 `~/.zcode/cli/config.json`
+中 `model.main` 指定的默认模型及其 provider 凭据，模型切换应由用户在
+ZCode/CLI 配置中完成。
 
 返回结构:`threadId`、`traceId`、`turnId`、`usage`、`projection` + 模型回复正文。
 
@@ -191,7 +194,7 @@ args = ["/path/to/zcode-mcp-plugin/server.py"]
 | 症状 | 原因 / 处理 |
 |---|---|
 | 服务器启动即报 `ZCode runtime not found` | 未安装 ZCode,或通过 `ZCODE_APP_PATH`、`ZCODE_BINARY`、`ZCODE_CLI_BUNDLE` 指定实际位置 |
-| 工具调用返回 `[zcode-error:zcode_exit_error] ... Model config is missing` | CLI 缺少模型提供方。运行 `python3 server.py --ensure-config`,或在 `~/.zcode/cli/config.json` 手动配置 `model.main`(如 `deepseek/deepseek-v4-flash`) |
+| 工具调用返回 `[zcode-error:zcode_exit_error] ... Model config is missing` | CLI 缺少模型提供方。运行 `python3 server.py --ensure-config`,或在 `~/.zcode/cli/config.json` 手动配置 `model.main`(格式为 `provider-id/model-id`) |
 | 工具调用返回 `Unknown option '--max-turns'` | 调用方显式传了 `maxTurns` 而本插件尚未忽略它(正常会被忽略)。这是 ZCode CLI 0.16.1 的已知缺陷 |
 | 调用超时 | 增大 `timeout` 参数或 `ZCODE_MCP_TIMEOUT`;ZCode 会话默认最长约 15 分钟,复杂任务请给足时间 |
 | 插件工具 `mcp__plugin_*` 不可见 | 确认对应插件已在 `~/.zcode/cli/config.json` 的 `enabledPlugins` 中启用(如 `ios-simulator@zcode-plugins-official`) |
@@ -208,7 +211,6 @@ args = ["/path/to/zcode-mcp-plugin/server.py"]
 | `ZCODE_MCP_TIMEOUT` | `900` | 单次工具调用超时(秒) |
 | `ZCODE_MCP_MAX_CONCURRENCY` | `2` | 并行 ZCode 会话上限 |
 | `ZCODE_MCP_LOG` | 空(关闭) | 服务器诊断日志文件路径 |
-| `ZCODE_MODEL` | — | 每次调用的模型覆盖(工具参数 `model` 优先) |
 
 ## 测试
 

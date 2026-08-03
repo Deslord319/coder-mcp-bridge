@@ -23,6 +23,10 @@ class WindowsStreamNormalizationTest(unittest.TestCase):
         proc.returncode = returncode
         return proc
 
+    def test_tool_schemas_do_not_expose_model_override(self):
+        self.assertNotIn("model", server.ZCODE_TOOL_SCHEMA["properties"])
+        self.assertNotIn("model", server.ZCODE_REPLY_TOOL_SCHEMA["properties"])
+
     @mock.patch("server.subprocess.Popen")
     def test_none_stderr_does_not_break_successful_result(self, popen):
         expected = {
@@ -40,6 +44,24 @@ class WindowsStreamNormalizationTest(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
         self.assertEqual(popen.call_args.kwargs["errors"], "replace")
+
+    @mock.patch("server.subprocess.Popen")
+    def test_inherited_model_override_is_removed(self, popen):
+        expected = {
+            "response": "MCP_ZCODE_OK",
+            "sessionId": "sess_default_model_test",
+        }
+        popen.return_value = self._process(json.dumps(expected), "")
+
+        with mock.patch.dict(os.environ, {"ZCODE_MODEL": "wrong/model"}):
+            actual = server.run_zcode(
+                "test",
+                zcode_bin="ZCode.exe",
+                zcode_bundle="zcode.cjs",
+            )
+
+        self.assertEqual(actual, expected)
+        self.assertNotIn("ZCODE_MODEL", popen.call_args.kwargs["env"])
 
     @mock.patch("server.subprocess.Popen")
     def test_none_stdout_becomes_structured_parse_error(self, popen):

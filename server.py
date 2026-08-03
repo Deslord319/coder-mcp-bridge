@@ -152,7 +152,7 @@ def _extract_json(text: str):
     return last_obj
 
 
-def run_zcode(prompt, *, thread_id=None, cwd=None, mode="yolo", model=None,
+def run_zcode(prompt, *, thread_id=None, cwd=None, mode="yolo",
               max_turns=None, allowed_tools=None, disallowed_tools=None,
               timeout=None, zcode_bin=None, zcode_bundle=None):
     """Run a ZCode headless session; return the parsed result dict.
@@ -190,9 +190,9 @@ def run_zcode(prompt, *, thread_id=None, cwd=None, mode="yolo", model=None,
     env = dict(os.environ)
     env["ELECTRON_RUN_AS_NODE"] = "1"
     env["NO_COLOR"] = "1"
-    if model:
-        # ZCODE_MODEL accepts "provider/model" or a model id
-        env["ZCODE_MODEL"] = model
+    # Always use the provider/model selected by the ZCode CLI config. A model
+    # override can select a different provider target without its credentials.
+    env.pop("ZCODE_MODEL", None)
 
     timeout = timeout or TIMEOUT_DEFAULT
     _log(
@@ -351,10 +351,6 @@ ZCODE_TOOL_SCHEMA = {
             "type": "string",
             "description": "Existing ZCode session id (sess_...) to resume instead of starting a new conversation.",
         },
-        "model": {
-            "type": "string",
-            "description": "Optional model override, e.g. 'deepseek/deepseek-v4-flash' or a model id.",
-        },
         "cwd": {
             "type": "string",
             "description": "Working directory for the session.",
@@ -401,10 +397,6 @@ ZCODE_REPLY_TOOL_SCHEMA = {
         "prompt": {
             "type": "string",
             "description": "The next user prompt to continue the ZCode conversation.",
-        },
-        "model": {
-            "type": "string",
-            "description": "Optional model override, e.g. 'deepseek/deepseek-v4-flash'.",
         },
         "cwd": {
             "type": "string",
@@ -575,7 +567,6 @@ class ZCodeMcpServer:
         result = run_zcode(
             prompt,
             thread_id=thread_id,
-            model=args.get("model"),
             cwd=args.get("cwd"),
             mode=kwargs["mode"],
             max_turns=args.get("maxTurns"),
