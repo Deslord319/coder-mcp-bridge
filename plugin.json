@@ -1,0 +1,17 @@
+{
+  "name": "zcode-mcp-bridge",
+  "version": "0.1.0",
+  "description": "Expose ZCode as an agent to any MCP client. Provides the `zcode` and `zcode-reply` tools (mirroring `codex mcp-server`'s codex/codex-reply), letting Claude Code, Codex, Cursor, or ZCode itself delegate complex coding tasks to a ZCode agent.",
+  "license": "MIT",
+  "mcpServers": {
+    "zcode-agent": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["${ZCODE_PLUGIN_ROOT}/server.py"],
+      "env": {
+        "ZCODE_MCP_MAX_CONCURRENCY": "2",
+        "ZCODE_MCP_TIMEOUT": "900"
+      }
+    }
+  }
+}

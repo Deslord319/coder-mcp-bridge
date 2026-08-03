@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local backups / runtime artifacts
+*.bak
+*.log
