@@ -18,13 +18,13 @@ MCP 客户端(Codex / Claude Code / Cursor / ZCode)
 server.py  ── 提供工具:zcode、zcode-reply
         │  启动子进程并设置 ELECTRON_RUN_AS_NODE=1
         ▼
-ZCode.app 内置 CLI 包(glm/zcode.cjs,无界面 headless 模式)
+ZCode 安装包内置 CLI 包(glm/zcode.cjs,无界面 headless 模式)
         │  参数 --prompt / --resume <sess_...> --json
         ▼
 ZCode 智能体会话(包含全部已启用插件:技能、Bash、MCP 工具等)
 ```
 
-- **零额外运行时依赖**:直接驱动 ZCode.app 内置的 CLI 包(通过 Electron 的 node 模式运行),无需安装 Node.js 或任何 Python 包。
+- **零额外运行时依赖**:直接驱动 ZCode 安装包内置的 CLI 包(通过 Electron 的 node 模式运行),无需另行安装 Node.js 或任何 Python 包。
 - **会话连续性**:`zcode-reply` 通过 `--resume <sessionId>` 续接,上下文跨调用保持(依赖 ZCode 的持久化会话)。
 - **能力继承**:无界面会话与桌面端共享同一套插件 / 技能 / MCP 配置。例如启用 `ios-simulator` 插件后,通过桥接的会话可以直接使用 `mcp__plugin_ios-simulator_ios-simulator__*` 这 20 个 iOS 工具(已实测可用)。
 
@@ -36,6 +36,20 @@ ZCode 智能体会话(包含全部已启用插件:技能、Bash、MCP 工具等)
 - 并发:通过 `ZCODE_MCP_MAX_CONCURRENCY` 限流,实测 6 路并行正常
 - 稳定性:连续 / 并行压测 0 失败(详见[测试](#测试))
 - 错误处理:参数校验、超时、CLI 异常均以结构化 `isError` 返回,不会导致服务器崩溃
+
+## 平台支持范围
+
+| 操作系统 | CPU 架构 | 支持状态 | 默认发现路径 | 备注 |
+|---|---|---|---|---|
+| macOS | Apple Silicon(arm64) | 支持 | `/Applications/ZCode.app`、`~/Applications/ZCode.app` | 使用标准 `.app/Contents/...` 布局 |
+| macOS | Intel(x64) | 支持 | `/Applications/ZCode.app`、`~/Applications/ZCode.app` | 与 Apple Silicon 使用相同的应用布局 |
+| Linux | ARM64(aarch64) | 支持,已验证 | `/opt/ZCode`、`~/.local/opt/ZCode` | 已在 Ubuntu 24.04 ARM64 + ZCode 3.6.5 验证完整 MCP 链路 |
+| Linux | x64 | 支持 | `/opt/ZCode`、`~/.local/opt/ZCode` | 使用官方 `.deb` 安装或将运行时解包至受支持路径 |
+| Windows | x64 / ARM64 | 暂不支持 | — | 尚未实现 Windows 默认路径发现和运行验证 |
+
+macOS 与 Linux 均直接运行 ZCode 内置 CLI,不启动桌面窗口,不依赖 X11、Wayland 或 Xvfb。桥接本身仅使用 Python 标准库,CPU 架构兼容性取决于所安装的官方 ZCode 包。
+
+如果 ZCode 没有安装在默认位置,可设置 `ZCODE_APP_PATH`;也可以分别用 `ZCODE_BINARY` 和 `ZCODE_CLI_BUNDLE` 指定 Electron 可执行文件与 `zcode.cjs`。Linux AppImage 用户应先解包或挂载 AppImage,再把这些变量指向对应文件。
 
 ## 目录结构
 
@@ -51,7 +65,7 @@ zcode-mcp-plugin/
 
 ## 环境要求
 
-- **ZCode** 已安装(macOS 默认 `/Applications/ZCode.app`;Linux 支持 `/opt/ZCode` 和 `~/.local/opt/ZCode`;可用环境变量 `ZCODE_APP_PATH` 覆盖)
+- **ZCode** 已安装于上述[支持平台](#平台支持范围)的默认路径,或已通过环境变量指定运行时位置
 - **`~/.zcode/cli/config.json` 已配置模型提供方(model provider)** —— CLI 需要它才能运行无界面会话。若桌面端 ZCode 已在用某个提供方,可一键导入:
 
 ```bash
@@ -167,7 +181,7 @@ args = ["/path/to/zcode-mcp-plugin/server.py"]
 
 | 症状 | 原因 / 处理 |
 |---|---|
-| 服务器启动即报 `ZCode.app not found` | 未安装 ZCode.app,或设置 `ZCODE_APP_PATH=/path/to/ZCode.app` |
+| 服务器启动即报 `ZCode runtime not found` | 未安装 ZCode,或通过 `ZCODE_APP_PATH`、`ZCODE_BINARY`、`ZCODE_CLI_BUNDLE` 指定实际位置 |
 | 工具调用返回 `[zcode-error:zcode_exit_error] ... Model config is missing` | CLI 缺少模型提供方。运行 `python3 server.py --ensure-config`,或在 `~/.zcode/cli/config.json` 手动配置 `model.main`(如 `deepseek/deepseek-v4-flash`) |
 | 工具调用返回 `Unknown option '--max-turns'` | 调用方显式传了 `maxTurns` 而本插件尚未忽略它(正常会被忽略)。这是 ZCode CLI 0.16.1 的已知缺陷 |
 | 调用超时 | 增大 `timeout` 参数或 `ZCODE_MCP_TIMEOUT`;ZCode 会话默认最长约 15 分钟,复杂任务请给足时间 |
