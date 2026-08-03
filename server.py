@@ -57,10 +57,18 @@ UNSUPPORTED_OPTIONS = {"max-turns", "allowed-tools", "settings", "permission-mod
 def _log(msg: str) -> None:
     if STDERR_LOG:
         try:
-            with open(STDERR_LOG, "a") as fh:
+            with open(STDERR_LOG, "a", encoding="utf-8", errors="backslashreplace") as fh:
                 fh.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
         except OSError:
             pass
+
+
+def _configure_stdio() -> None:
+    """Use MCP's required UTF-8 wire encoding on Windows and other locales."""
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="strict")
 
 
 # ---------------------------------------------------------------------------
@@ -187,13 +195,18 @@ def run_zcode(prompt, *, thread_id=None, cwd=None, mode="yolo", model=None,
         env["ZCODE_MODEL"] = model
 
     timeout = timeout or TIMEOUT_DEFAULT
-    _log("RUN %s" % " ".join(cmd))
+    _log(
+        "RUN binary=%s bundle=%s resume=%s cwd=%s mode=%s prompt_chars=%s"
+        % (zcode_bin, zcode_bundle, bool(thread_id), cwd or "", mode or "", len(prompt))
+    )
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
     )
     try:
@@ -208,6 +221,21 @@ def run_zcode(prompt, *, thread_id=None, cwd=None, mode="yolo", model=None,
             "ZCode session timed out after %ss" % timeout, code="timeout"
         )
 
+    _log(
+        "RAW EXIT %s out_type=%s out_len=%s err_type=%s err_len=%s"
+        % (
+            proc.returncode,
+            type(out).__name__,
+            len(out) if out is not None else "none",
+            type(err).__name__,
+            len(err) if err is not None else "none",
+        )
+    )
+    # Electron on Windows can leave one redirected stream as None even when
+    # communicate() completes successfully. Normalize both streams before
+    # logging lengths or slicing error output.
+    out = out or ""
+    err = err or ""
     _log("EXIT %s out=%s err=%s" % (proc.returncode, len(out), len(err)))
     if proc.returncode != 0:
         raise SessionError(
@@ -636,6 +664,7 @@ class ZCodeMcpServer:
 
 
 def main(argv):
+    _configure_stdio()
     if "--ensure-config" in argv:
         return ensure_cli_config()
     if "--probe" in argv:
