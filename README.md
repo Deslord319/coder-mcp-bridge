@@ -51,7 +51,7 @@ zcode-mcp-plugin/
 
 ## 环境要求
 
-- **ZCode.app** 已安装(默认路径 `/Applications/ZCode.app`,可用环境变量 `ZCODE_APP_PATH` 覆盖)
+- **ZCode** 已安装(macOS 默认 `/Applications/ZCode.app`;Linux 支持 `/opt/ZCode` 和 `~/.local/opt/ZCode`;可用环境变量 `ZCODE_APP_PATH` 覆盖)
 - **`~/.zcode/cli/config.json` 已配置模型提供方(model provider)** —— CLI 需要它才能运行无界面会话。若桌面端 ZCode 已在用某个提供方,可一键导入:
 
 ```bash
@@ -179,8 +179,9 @@ args = ["/path/to/zcode-mcp-plugin/server.py"]
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `ZCODE_APP_PATH` | `/Applications/ZCode.app` | ZCode.app 路径 |
-| `ZCODE_CLI_BUNDLE` | `<app>/Contents/Resources/glm/zcode.cjs` | CLI 包路径覆盖 |
+| `ZCODE_APP_PATH` | 平台默认路径 | ZCode 应用/运行时根目录 |
+| `ZCODE_BINARY` | 自动发现 | Electron 可执行文件路径覆盖 |
+| `ZCODE_CLI_BUNDLE` | 自动发现 | CLI 包 `zcode.cjs` 路径覆盖 |
 | `ZCODE_MCP_TIMEOUT` | `900` | 单次工具调用超时(秒) |
 | `ZCODE_MCP_MAX_CONCURRENCY` | `2` | 并行 ZCode 会话上限 |
 | `ZCODE_MCP_LOG` | 空(关闭) | 服务器诊断日志文件路径 |

@@ -75,21 +75,28 @@ def _first_existing(paths):
 
 
 def discover_zcode():
-    """Locate the ZCode app binary and the bundled CLI bundle."""
+    """Locate the ZCode runtime and bundled CLI on macOS or Linux."""
     app = os.environ.get("ZCODE_APP_PATH") or _first_existing([
         "/Applications/ZCode.app",
         os.path.expanduser("~/Applications/ZCode.app"),
+        "/opt/ZCode",
+        os.path.expanduser("~/.local/opt/ZCode"),
     ])
     if not app:
         raise RuntimeError(
-            "ZCode.app not found. Install it or set ZCODE_APP_PATH=/path/to/ZCode.app"
+            "ZCode runtime not found. Install it or set ZCODE_APP_PATH=/path/to/ZCode"
         )
-    binary = os.path.join(app, "Contents", "MacOS", "ZCode")
-    bundle = os.environ.get("ZCODE_CLI_BUNDLE") or os.path.join(
-        app, "Contents", "Resources", "glm", "zcode.cjs"
-    )
+
+    binary = os.environ.get("ZCODE_BINARY") or _first_existing([
+        os.path.join(app, "Contents", "MacOS", "ZCode"),
+        os.path.join(app, "zcode"),
+    ])
+    bundle = os.environ.get("ZCODE_CLI_BUNDLE") or _first_existing([
+        os.path.join(app, "Contents", "Resources", "glm", "zcode.cjs"),
+        os.path.join(app, "resources", "glm", "zcode.cjs"),
+    ])
     for p, label in ((binary, "ZCode binary"), (bundle, "CLI bundle")):
-        if not os.path.isfile(p):
+        if not p or not os.path.isfile(p):
             raise RuntimeError("%s not found at %s" % (label, p))
     return binary, bundle
 
