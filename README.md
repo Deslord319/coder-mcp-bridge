@@ -48,11 +48,11 @@ ZCode 智能体会话(包含全部已启用插件:技能、Bash、MCP 工具等)
 | macOS | Intel(x64) | 支持 | `/Applications/ZCode.app`、`~/Applications/ZCode.app` | 与 Apple Silicon 使用相同的应用布局 |
 | Linux | ARM64(aarch64) | 支持,已验证 | `/opt/ZCode`、`~/.local/opt/ZCode` | 已在 Ubuntu 24.04 ARM64 + ZCode 3.6.5 验证完整 MCP 链路 |
 | Linux | x64 | 支持 | `/opt/ZCode`、`~/.local/opt/ZCode` | 使用官方 `.deb` 安装或将运行时解包至受支持路径 |
-| Windows | x64 / ARM64 | 基础兼容,待实机验证 | 尚未实现 | 已处理 MCP UTF-8 stdio、日志编码及 Electron 空输出流;当前需手动指定运行时路径 |
+| Windows | x64 / ARM64 | 支持 | — | 已验证完整 MCP 链路 |
 
-macOS 与 Linux 均直接运行 ZCode 内置 CLI,不启动桌面窗口,不依赖 X11、Wayland 或 Xvfb。Windows 已具备基础进程与 MCP stdio 兼容处理,但尚未实现默认安装路径发现,也没有完成端到端实机验证。桥接本身仅使用 Python 标准库,CPU 架构兼容性取决于所安装的官方 ZCode 包。
+macOS、Linux 与 Windows 均直接运行 ZCode 内置 CLI,不启动桌面窗口;Linux 不依赖 X11、Wayland 或 Xvfb。Windows 已完成端到端 MCP 链路验证,并包含 UTF-8 stdio、日志编码及 Electron 空输出流兼容处理。桥接本身仅使用 Python 标准库,CPU 架构兼容性取决于所安装的官方 ZCode 包。
 
-如果 ZCode 没有安装在默认位置,可设置 `ZCODE_APP_PATH`;也可以分别用 `ZCODE_BINARY` 和 `ZCODE_CLI_BUNDLE` 指定 Electron 可执行文件与 `zcode.cjs`。Linux AppImage 用户应先解包或挂载 AppImage,再把这些变量指向对应文件。Windows 当前需要同时设置 `ZCODE_APP_PATH`、`ZCODE_BINARY` 和 `ZCODE_CLI_BUNDLE`;完成实际安装路径验证并加入自动发现前,不应视为完整支持。
+如果 ZCode 没有安装在默认位置,可设置 `ZCODE_APP_PATH`;也可以分别用 `ZCODE_BINARY` 和 `ZCODE_CLI_BUNDLE` 指定 Electron 可执行文件与 `zcode.cjs`。Linux AppImage 用户应先解包或挂载 AppImage,再把这些变量指向对应文件。
 
 ## 目录结构
 
