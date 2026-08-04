@@ -1,7 +1,7 @@
 {
   "name": "zcode-mcp-bridge",
-  "version": "0.3.0",
-  "description": "Event-driven ZCode scheduling bridge for Codex: concurrent resource-aware runs, replayable observation, recovery, background control, branching, context compaction, and lifecycle management.",
+  "version": "0.4.0",
+  "description": "Event-driven ZCode scheduling bridge for Codex: cross-process resource leases, replayable observation, phase-safe control, recovery, branching, context compaction, and verified lifecycle management.",
   "license": "MIT",
   "mcpServers": {
     "zcode-agent": {

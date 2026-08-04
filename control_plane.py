@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 
+from resource_leases import ResourceLeaseStore
 from zcode_protocol import (
     ProtocolError,
     ZCodeProtocolClient,
@@ -195,6 +196,45 @@ def _normalize_resources(cwd, workspace_access, resources):
     return modes
 
 
+_STRUCTURED_PATH_KEYS = {
+    "path", "filepath", "file_path", "cwd", "workingdirectory",
+    "working_directory", "destination", "destinationpath", "sourcepath",
+}
+_STRUCTURED_WRITE_TOOLS = {
+    "write", "edit", "multiedit", "applypatch", "apply_patch",
+    "createfile", "deletefile", "movefile", "renamefile",
+}
+
+
+def _structured_paths(value, cwd, parent_key=None):
+    paths = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            lowered = str(key).replace("-", "").lower()
+            if lowered in _STRUCTURED_PATH_KEYS and isinstance(child, str):
+                candidate = child.strip()
+                if candidate and "://" not in candidate:
+                    if not os.path.isabs(candidate):
+                        candidate = os.path.join(cwd, candidate)
+                    paths.append(os.path.realpath(candidate))
+            else:
+                paths.extend(_structured_paths(child, cwd, key))
+    elif isinstance(value, list):
+        for child in value:
+            paths.extend(_structured_paths(child, cwd, parent_key))
+    return list(dict.fromkeys(paths))
+
+
+def _path_in_roots(path, roots):
+    for root in roots:
+        try:
+            if os.path.commonpath([path, root]) == root:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 class RunRecord:
     def __init__(self, args, *, recovered=False):
         self.run_id = "run_" + uuid.uuid4().hex
@@ -229,11 +269,16 @@ class RunRecord:
         self.events = deque(maxlen=160)
         self.active_tools = {}
         self.pending_guidance = deque()
+        self.guidance_dispatching = False
+        self.last_terminal_status = None
+        self.control_failures = deque(maxlen=8)
         self.cancel_requested = False
         self.timeout_requested = False
         self.stop_generation = 0
         self.turn_count = 0
         self.released = False
+        self.lease_acquired = False
+        self.lease_blockers = []
         self.closed = False
         self.input_id = "input_" + uuid.uuid4().hex
         self.native_status = None
@@ -276,7 +321,8 @@ class ZCodeControlPlane:
 
     def __init__(self, zcode_bin=None, zcode_bundle=None, *, max_concurrency=0,
                  protocol=None, protocol_factory=None, runtime_model_resolver=None,
-                 logger=None):
+                 lease_store=None, guidance_retry_seconds=10.0,
+                 native_stop_wait_seconds=10.0, logger=None):
         self._lock = threading.RLock()
         self._cv = threading.Condition(self._lock)
         self._runs = {}
@@ -285,6 +331,9 @@ class ZCodeControlPlane:
         self._queue = []
         self._active = set()
         self._max_concurrency = max(0, int(max_concurrency))
+        self._lease_store = lease_store or ResourceLeaseStore()
+        self._guidance_retry_seconds = max(float(guidance_retry_seconds), 0.1)
+        self._native_stop_wait_seconds = max(float(native_stop_wait_seconds), 0.1)
         self._logger = logger or (lambda _message: None)
         self._transport_recovering = False
         self._runtime_model_resolver = runtime_model_resolver or resolve_runtime_model
@@ -321,6 +370,7 @@ class ZCodeControlPlane:
 
             if method == "interaction/requestPermission":
                 tool_name = str(params.get("toolName") or "unknown")
+                normalized_tool = tool_name.replace("-", "").replace("_", "").lower()
                 if run.mode == "plan":
                     self._event(run, "interaction.permission-denied", {
                         "toolName": tool_name,
@@ -330,9 +380,40 @@ class ZCodeControlPlane:
                         "decision": "deny",
                         "reason": "Headless plan-mode runs may not execute approval-gated tools",
                     }
+                allowed_roots = [run.cwd] + [
+                    key for key in run.resource_modes
+                    if os.path.isabs(key) and key != run.cwd
+                ]
+                candidate_paths = _structured_paths(params, run.cwd)
+                outside = [
+                    path for path in candidate_paths
+                    if not _path_in_roots(path, allowed_roots)
+                ]
+                if (run.workspace_access == "shared" and
+                        normalized_tool in _STRUCTURED_WRITE_TOOLS):
+                    self._event(run, "interaction.permission-denied", {
+                        "toolName": tool_name,
+                        "reason": "shared workspace is read-only for structured write tools",
+                    })
+                    return {
+                        "decision": "deny",
+                        "reason": "Structured writes require workspaceAccess=exclusive",
+                    }
+                if outside:
+                    self._event(run, "interaction.permission-denied", {
+                        "toolName": tool_name,
+                        "reason": "structured path outside declared workspace/resources",
+                        "paths": outside[:8],
+                    })
+                    return {
+                        "decision": "deny",
+                        "reason": "Requested path is outside the declared workspace/resources",
+                    }
                 self._event(run, "interaction.permission-approved", {
                     "toolName": tool_name,
                     "riskLevel": params.get("riskLevel"),
+                    "scopeChecked": bool(candidate_paths),
+                    "paths": candidate_paths[:8],
                 })
                 return {
                     "decision": "allow",
@@ -378,8 +459,14 @@ class ZCodeControlPlane:
                         if item.get("taskId")
                     ]))
         for session_id, task_ids in sessions:
-            self._stop_native_session(session_id, task_ids, wait_seconds=0)
-        self._protocol.close()
+            try:
+                self._stop_native_session(session_id, task_ids, wait_seconds=5)
+            except Exception as exc:
+                self._logger("shutdown stop failed for %s: %s" % (session_id, exc))
+        try:
+            self._protocol.close()
+        finally:
+            self._lease_store.close()
 
     def start(self, args):
         prompt = args.get("prompt")
@@ -480,11 +567,18 @@ class ZCodeControlPlane:
                 result["nativeRefreshError"] = refresh_error
             return result
 
-    def control(self, run_id, action, *, prompt=None, task_id=None):
+    def control(self, run_id, action, *, prompt=None, task_id=None,
+                if_revision=None, if_status=None):
         if action == "guide":
-            return self._guide(run_id, prompt, interrupt=False)
+            return self._guide(
+                run_id, prompt, interrupt=False,
+                if_revision=if_revision, if_status=if_status,
+            )
         if action == "interrupt":
-            return self._guide(run_id, prompt, interrupt=True)
+            return self._guide(
+                run_id, prompt, interrupt=True,
+                if_revision=if_revision, if_status=if_status,
+            )
         if action == "cancel":
             return self.cancel(run_id)
         with self._lock:
@@ -668,6 +762,7 @@ class ZCodeControlPlane:
             self._event(run, "session.closed", {})
             self._session_runs.pop(session_id, None)
             self._session_bindings.pop(session_id, None)
+            self._release(run)
         result = self.snapshot(run_id, result_chars=0)
         if native:
             result["native"] = native
@@ -704,16 +799,32 @@ class ZCodeControlPlane:
                 run.phase = "cancelling"
                 stop = bool(run.session_id)
                 self._event(run, "run.stop-requested", {})
-        self._cancel_native_background(session_id, background_ids)
         if background_only:
+            cleanup_error = None
+            try:
+                self._stop_native_session(
+                    session_id,
+                    background_ids,
+                    wait_seconds=self._native_stop_wait_seconds,
+                )
+            except Exception as exc:
+                cleanup_error = _bounded(str(exc), 1200)
             with self._cv:
                 run = self._get(run_id)
-                run.status = "cancelled"
-                run.phase = "terminal"
+                run.status = "failed" if cleanup_error else "cancelled"
+                run.phase = "resource-cleanup-required" if cleanup_error else "terminal"
                 run.finished_ms = now_ms()
-                self._event(run, "run.cancelled", {"backgroundTasks": len(background_ids)})
-                self._release(run)
+                if cleanup_error:
+                    run.error = cleanup_error
+                    self._event(run, "resource.cleanup-failed", {
+                        "message": cleanup_error,
+                        "leaseRetained": True,
+                    })
+                else:
+                    self._event(run, "run.cancelled", {"backgroundTasks": len(background_ids)})
+                    self._release(run)
             return self.snapshot(run_id, result_chars=0)
+        self._cancel_native_background(session_id, background_ids)
         if stop:
             self._stop_session(run_id, cancel=True)
         return self.snapshot(run_id, result_chars=0)
@@ -781,10 +892,23 @@ class ZCodeControlPlane:
         try:
             with self._cv:
                 run = self._get(run_id)
-                while not self._can_start(run):
+                while True:
                     if run.status in TERMINAL_STATES:
                         return
-                    self._cv.wait()
+                    if not self._can_start(run):
+                        self._cv.wait(self._lease_store.poll_seconds)
+                        continue
+                    lease = self._lease_store.try_acquire(run.run_id, run.resource_modes)
+                    if lease.get("acquired"):
+                        run.lease_acquired = True
+                        run.lease_blockers = []
+                        break
+                    blockers = lease.get("blockers") or []
+                    if blockers != run.lease_blockers:
+                        run.lease_blockers = blockers
+                        run.phase = "waiting-for-global-resource"
+                        self._event(run, "resource.waiting", {"blockers": blockers})
+                    self._cv.wait(self._lease_store.poll_seconds)
                 self._queue.remove(run_id)
                 self._active.add(run_id)
                 run.status = "starting"
@@ -798,6 +922,7 @@ class ZCodeControlPlane:
             if run.runtime_model and not run.thought_level:
                 run.thought_level = run.runtime_model.get("thoughtLevel")
             session = self._open_session(run)
+            self._lease_store.set_guard_pid(getattr(self._protocol, "process_id", None))
             session_id = extract_session_id(session) or run.thread_id
             if not session_id:
                 raise ControlPlaneError("ZCode did not return a session id", "protocol_error")
@@ -1012,11 +1137,9 @@ class ZCodeControlPlane:
                 ]
                 session_id = run.session_id
                 run.timeout_requested = True
-                run.status = "timed_out"
-                run.phase = "terminal"
-                run.finished_ms = now_ms()
+                run.status = "stopping"
+                run.phase = "background-timeout-cleanup"
                 self._event(run, "run.timeout", {"timeoutSeconds": timeout})
-                self._release(run)
                 background_only = True
             else:
                 run.timeout_requested = True
@@ -1025,7 +1148,31 @@ class ZCodeControlPlane:
                 run.stop_generation += 1
                 self._event(run, "run.timeout", {"timeoutSeconds": timeout})
         if background_only:
-            self._cancel_native_background(session_id, task_ids)
+            cleanup_error = None
+            try:
+                self._stop_native_session(
+                    session_id,
+                    task_ids,
+                    wait_seconds=self._native_stop_wait_seconds,
+                )
+            except Exception as exc:
+                cleanup_error = _bounded(str(exc), 1200)
+            with self._cv:
+                run = self._get(run_id)
+                run.status = "failed" if cleanup_error else "timed_out"
+                run.phase = "resource-cleanup-required" if cleanup_error else "terminal"
+                run.finished_ms = now_ms()
+                if cleanup_error:
+                    run.error = cleanup_error
+                    self._event(run, "resource.cleanup-failed", {
+                        "message": cleanup_error,
+                        "leaseRetained": True,
+                    })
+                else:
+                    self._event(run, "run.timeout-cleanup-complete", {
+                        "backgroundTasks": len(task_ids),
+                    })
+                    self._release(run)
             return
         self._stop_session(run_id, cancel=True)
 
@@ -1058,14 +1205,7 @@ class ZCodeControlPlane:
                 snapshot = self._protocol.request(
                     "session/read", {"sessionId": session_id, "messageLimit": 1}, timeout=5
                 )
-                session = snapshot.get("session") if isinstance(snapshot, dict) else None
-                projection = snapshot.get("projection") if isinstance(snapshot, dict) else None
-                native_status = (
-                    (session or {}).get("status") or (projection or {}).get("status") or "idle"
-                )
-                stopped = str(native_status).lower() not in {
-                    "running", "waiting", "starting", "stopping", "recovering"
-                }
+                stopped = self._native_snapshot_stopped(snapshot)
             except Exception as exc:
                 stop_error = stop_error or _bounded(str(exc), 500)
                 break
@@ -1080,6 +1220,30 @@ class ZCodeControlPlane:
         if stop_error:
             result["warning"] = stop_error
         return result
+
+    @staticmethod
+    def _native_snapshot_stopped(snapshot):
+        session = snapshot.get("session") if isinstance(snapshot, dict) else None
+        projection = snapshot.get("projection") if isinstance(snapshot, dict) else None
+        native_status = (
+            (session or {}).get("status") or (projection or {}).get("status") or "idle"
+        )
+        background = (projection or {}).get("backgroundJobs") or []
+        live_background = any(
+            str((item or {}).get("status") or "").lower() in {
+                "pending", "queued", "starting", "running", "waiting", "blocked"
+            }
+            for item in background if isinstance(item, dict)
+        )
+        return not live_background and str(native_status).lower() not in {
+            "running", "waiting", "starting", "stopping", "recovering"
+        }
+
+    def _native_session_stopped(self, session_id):
+        snapshot = self._protocol.request(
+            "session/read", {"sessionId": session_id, "messageLimit": 1}, timeout=5
+        )
+        return self._native_snapshot_stopped(snapshot)
 
     def _cleanup_launch_failure(self, run):
         session_id = run.session_id
@@ -1101,7 +1265,7 @@ class ZCodeControlPlane:
                 self._logger("launch cleanup close failed for %s: %s" % (session_id, exc))
         return {"stopped": stopped, "closed": closed}
 
-    def _guide(self, run_id, prompt, *, interrupt):
+    def _guide(self, run_id, prompt, *, interrupt, if_revision=None, if_status=None):
         if not isinstance(prompt, str) or not prompt.strip():
             raise ControlPlaneError("prompt is required for guidance", "invalid_params")
         direct = False
@@ -1110,6 +1274,18 @@ class ZCodeControlPlane:
             run = self._get(run_id)
             if run.status in TERMINAL_STATES:
                 raise ControlPlaneError("run is already terminal", "run_terminal")
+            if if_revision is not None and int(if_revision) != run.revision:
+                raise ControlPlaneError(
+                    "control snapshot is stale; observe the run before guiding",
+                    "stale_control",
+                    {"expectedRevision": int(if_revision), "actualRevision": run.revision},
+                )
+            if if_status is not None and str(if_status) != run.status:
+                raise ControlPlaneError(
+                    "run status changed from %s to %s" % (if_status, run.status),
+                    "stale_control",
+                    {"expectedStatus": str(if_status), "actualStatus": run.status},
+                )
             delivery = "interrupt" if interrupt else "after-turn"
             run.pending_guidance.append({"prompt": prompt, "delivery": delivery})
             self._event(run, "guidance.queued", {"delivery": delivery})
@@ -1164,39 +1340,108 @@ class ZCodeControlPlane:
     def _dispatch_guidance(self, run_id):
         with self._cv:
             run = self._get(run_id)
-            if not run.pending_guidance or run.cancel_requested:
+            if (not run.pending_guidance or run.cancel_requested or
+                    run.guidance_dispatching):
                 return
-            guidance = run.pending_guidance.popleft()
+            guidance = run.pending_guidance[0]
+            run.guidance_dispatching = True
             run.stop_generation += 1
-            run.status = "running"
-            run.phase = "guided-turn"
-            run.turn_count += 1
+            run.phase = "guidance-waiting-for-ready"
             input_id = "input_" + uuid.uuid4().hex
-            self._event(run, "guidance.sending", {"delivery": guidance["delivery"]})
+            self._event(run, "guidance.waiting", {"delivery": guidance["delivery"]})
             session_id = run.session_id
+            runtime_model = run.runtime_model
+        sent = None
+        deadline = time.monotonic() + self._guidance_retry_seconds
+        delay = 0.05
         try:
-            send_params = {
-                "sessionId": session_id,
-                "inputId": input_id,
-                "queryId": input_id,
-                "content": guidance["prompt"],
-            }
-            if run.runtime_model:
-                send_params["runtimeModel"] = run.runtime_model
-            sent = self._protocol.request("session/send", send_params, timeout=30)
+            while True:
+                with self._lock:
+                    current = self._get(run_id)
+                    if current.cancel_requested or not current.pending_guidance:
+                        current.guidance_dispatching = False
+                        return
+                send_params = {
+                    "sessionId": session_id,
+                    "inputId": input_id,
+                    "queryId": input_id,
+                    "content": guidance["prompt"],
+                }
+                if runtime_model:
+                    send_params["runtimeModel"] = runtime_model
+                try:
+                    sent = self._protocol.request("session/send", send_params, timeout=30)
+                    break
+                except Exception as exc:
+                    message = str(exc).lower()
+                    retryable = (
+                        "prompt is already running" in message or
+                        "already has a running prompt" in message
+                    )
+                    if not retryable or time.monotonic() >= deadline:
+                        raise
+                    with self._cv:
+                        current = self._get(run_id)
+                        self._event(current, "guidance.retrying", {
+                            "reason": _bounded(str(exc), 300),
+                            "retryInMs": int(delay * 1000),
+                        })
+                    time.sleep(delay)
+                    delay = min(delay * 2, 1.0)
             with self._cv:
                 run = self._get(run_id)
+                if run.pending_guidance and run.pending_guidance[0] is guidance:
+                    run.pending_guidance.popleft()
+                run.guidance_dispatching = False
+                run.last_terminal_status = None
+                run.status = "running"
+                run.phase = "guided-turn"
+                run.turn_count += 1
                 if isinstance(sent.get("stateRevision"), int):
                     run.native_revision = sent["stateRevision"]
+                self._event(run, "guidance.sent", {"delivery": guidance["delivery"]})
         except Exception as exc:
+            finalize_status = None
+            native_stopped = False
+            try:
+                native_stopped = self._native_session_stopped(session_id)
+            except Exception:
+                pass
             with self._cv:
                 run = self._get(run_id)
-                run.status = "failed"
-                run.phase = "guidance-failed"
-                run.error = _bounded(str(exc), 1200)
-                run.finished_ms = now_ms()
-                self._event(run, "run.failed", {"message": run.error})
-                self._release(run)
+                if run.pending_guidance and run.pending_guidance[0] is guidance:
+                    run.pending_guidance.popleft()
+                run.guidance_dispatching = False
+                failure = {
+                    "action": guidance["delivery"],
+                    "message": _bounded(str(exc), 1200),
+                    "atMs": now_ms(),
+                }
+                run.control_failures.append(failure)
+                self._event(run, "guidance.failed", failure)
+                if native_stopped and str(run.last_terminal_status or "").lower() in {
+                    "success", "completed", "complete", "end"
+                }:
+                    finalize_status = run.last_terminal_status
+                    run.status = "finalizing"
+                    run.phase = "reading-result-after-control-failure"
+                    self._touch(run)
+                else:
+                    run.status = "failed"
+                    run.phase = (
+                        "guidance-failed" if native_stopped else
+                        "resource-cleanup-required"
+                    )
+                    run.error = failure["message"]
+                    run.finished_ms = now_ms()
+                    self._event(run, "run.failed", {
+                        "message": run.error,
+                        "leaseRetained": not native_stopped,
+                    })
+                    if native_stopped:
+                        self._release(run)
+            if finalize_status is not None:
+                self._finalize(run_id, finalize_status)
 
     def _on_notification(self, message):
         if not isinstance(message, dict):
@@ -1427,6 +1672,7 @@ class ZCodeControlPlane:
         run.model_state["status"] = "idle"
         run.model_state["reasoningActive"] = False
         run.native_status = "idle"
+        run.last_terminal_status = status
         self._event(run, "turn.terminal", {"status": status})
         goal_status = str((run.goal_state or {}).get("status") or "").lower()
         if run.goal and run.status == "starting" and goal_status in {"", "active"}:
@@ -1696,6 +1942,9 @@ class ZCodeControlPlane:
                     resumed = self._protocol.request(
                         "session/resume", resume_params, timeout=30
                     )
+                    self._lease_store.set_guard_pid(
+                        getattr(self._protocol, "process_id", None)
+                    )
                     with self._cv:
                         run = self._get(run_id)
                         self._apply_snapshot(run, resumed)
@@ -1725,6 +1974,9 @@ class ZCodeControlPlane:
         if run.released:
             return
         run.released = True
+        if run.lease_acquired:
+            self._lease_store.release(run.run_id)
+            run.lease_acquired = False
         self._active.discard(run.run_id)
         if run.run_id in self._queue:
             self._queue.remove(run.run_id)
@@ -1767,6 +2019,11 @@ class ZCodeControlPlane:
             "resources": [
                 {"key": key, "mode": mode} for key, mode in run.resource_modes.items()
             ],
+            "resourceLease": {
+                "scope": "cross-process",
+                "acquired": run.lease_acquired,
+                "blockers": run.lease_blockers[:12],
+            },
             "native": {
                 "status": run.native_status,
                 "stateRevision": run.native_revision,
@@ -1780,6 +2037,17 @@ class ZCodeControlPlane:
             "counts": dict(run.counts),
             "activeTools": list(run.active_tools.values())[:12],
             "backgroundTasks": run.background_tasks[:16],
+            "controlFailures": list(run.control_failures),
+            "permissionPolicy": {
+                "headless": True,
+                "workspaceAccess": run.workspace_access,
+                "structuredPathsEnforced": True,
+                "shellBoundary": "advisory",
+                "allowedRoots": [run.cwd] + [
+                    key for key in run.resource_modes
+                    if os.path.isabs(key) and key != run.cwd
+                ],
+            },
             "subagents": run.subagents,
             "context": run.context,
             "goal": run.goal_state,

@@ -41,7 +41,7 @@ TIMEOUT_DEFAULT = int(os.environ.get("ZCODE_MCP_TIMEOUT", "900") or 900)      # 
 # optional operator safety cap.
 MAX_CONCURRENCY = int(os.environ.get("ZCODE_MCP_MAX_CONCURRENCY", "0") or 0)
 PROTOCOL_VERSION = "2025-03-26"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.4.0"
 STDERR_LOG = os.environ.get("ZCODE_MCP_LOG", "")
 
 def _log(msg: str) -> None:
@@ -214,7 +214,7 @@ ZCODE_START_SCHEMA = {
         "mode": {
             "type": "string",
             "enum": ["build", "edit", "plan", "yolo", "auto"],
-            "description": "Execution mode. In managed headless build/edit/auto runs, Codex authorizes ZCode tool and implementation-plan permission requests; arbitrary user questions are declined. Native durable goals cannot use plan.",
+            "description": "Execution mode. Managed non-plan runs resolve headless tool and implementation-plan permissions inside declared structured path roots; arbitrary user questions are declined. Native durable goals cannot use plan.",
         },
         "thoughtLevel": {"type": "string", "enum": ["high", "max"]},
         "model": {
@@ -225,7 +225,12 @@ ZCODE_START_SCHEMA = {
         },
         "toolAllowlist": {"type": "array", "items": {"type": "string"}},
         "toolDenylist": {"type": "array", "items": {"type": "string"}},
-        "workspaceAccess": {"type": "string", "enum": ["shared", "exclusive"], "default": "exclusive"},
+        "workspaceAccess": {
+            "type": "string",
+            "enum": ["shared", "exclusive"],
+            "default": "exclusive",
+            "description": "Cross-Bridge scheduling lease. Shared denies structured write permissions; exclusive permits them inside declared roots. Shell command boundaries remain advisory.",
+        },
         "resources": {
             "type": "array",
             "items": {
@@ -237,7 +242,7 @@ ZCODE_START_SCHEMA = {
                 "required": ["key"],
                 "additionalProperties": False,
             },
-            "description": "Additional conflict domains such as simulator or DerivedData. Codex owns global concurrency.",
+            "description": "Additional cross-Bridge conflict domains such as simulator or DerivedData. Absolute path keys also authorize structured writes under that root. Codex owns global concurrency.",
         },
         "goal": {
             "type": "string",
@@ -297,6 +302,15 @@ ZCODE_CONTROL_SCHEMA = {
         },
         "prompt": {"type": "string", "description": "Required for guide or interrupt."},
         "taskId": {"type": "string", "description": "Required for cancel-background."},
+        "ifRevision": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional optimistic guard copied from the latest wait/observe revision.",
+        },
+        "ifStatus": {
+            "type": "string",
+            "description": "Optional optimistic guard copied from the latest wait/observe status.",
+        },
     },
     "required": ["runId", "action"],
     "additionalProperties": False,
@@ -406,8 +420,8 @@ class ZCodeMcpServer:
                 "title": "Start ZCode Run",
                 "description": (
                     "Start one non-blocking ZCode task using exactly one of prompt (one turn) or goal (durable). "
-                    "Codex owns global concurrency; independent worktrees "
-                    "and resources run concurrently while conflicting exclusive resources queue. Continue "
+                    "Codex owns global concurrency; independent worktrees and resources run concurrently while "
+                    "conflicting exclusive resources queue across Bridge processes. Continue "
                     "with zcode-wait instead of polling or sleeping."
                 ),
                 "inputSchema": ZCODE_START_SCHEMA,
@@ -439,7 +453,9 @@ class ZCodeMcpServer:
                 "title": "Control ZCode Run",
                 "description": (
                     "Guide after the current turn, interrupt and guide, cancel a run or one native background "
-                    "task, and pause/resume a durable goal. Guidance is never represented as mid-turn injection."
+                    "task, and pause/resume a durable goal. Busy guidance retries after native readiness, and a "
+                    "control failure never overwrites an already successful turn. Optional ifRevision/ifStatus "
+                    "guards reject stale decisions."
                 ),
                 "inputSchema": ZCODE_CONTROL_SCHEMA,
                 "outputSchema": RUN_OUTPUT_SCHEMA,
@@ -552,6 +568,7 @@ class ZCodeMcpServer:
             return control.control(
                 args.get("runId", ""), args.get("action", ""),
                 prompt=args.get("prompt"), task_id=args.get("taskId"),
+                if_revision=args.get("ifRevision"), if_status=args.get("ifStatus"),
             )
         if name == "zcode-recover":
             return control.recover(args)

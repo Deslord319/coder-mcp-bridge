@@ -46,12 +46,16 @@ class McpContractTest(unittest.TestCase):
         self.assertFalse(start["additionalProperties"])
         for name in ("thoughtLevel", "model", "toolAllowlist", "toolDenylist", "workspaceAccess", "resources", "goal"):
             self.assertIn(name, start["properties"])
-        self.assertIn("Codex authorizes", start["properties"]["mode"]["description"])
+        self.assertIn("headless", start["properties"]["mode"]["description"])
+        self.assertIn("Cross-Bridge", start["properties"]["workspaceAccess"]["description"])
         actions = tools["zcode-control"]["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(
             {"guide", "interrupt", "cancel", "cancel-background", "pause-goal", "resume-goal"},
             set(actions),
         )
+        controls = tools["zcode-control"]["inputSchema"]["properties"]
+        self.assertIn("ifRevision", controls)
+        self.assertIn("ifStatus", controls)
         targets = tools["zcode-branch"]["inputSchema"]["properties"]["targetKind"]["enum"]
         self.assertEqual({"latestCheckpoint", "checkpoint", "message", "turn"}, set(targets))
 
@@ -61,6 +65,7 @@ class McpContractTest(unittest.TestCase):
         self.assertLess(len(descriptions), 2200)
         self.assertIn("Codex owns global concurrency", descriptions)
         self.assertIn("run concurrently", descriptions)
+        self.assertIn("across Bridge processes", descriptions)
         self.assertIn("zcode-wait instead of polling or sleeping", descriptions)
         self.assertIn("Native subscriptions and replay", descriptions)
         self.assertIn("model/reasoning activity", descriptions)

@@ -216,6 +216,12 @@ class ZCodeProtocolClient:
             )
         return message.get("result") or {}
 
+    @property
+    def process_id(self):
+        with self._state_lock:
+            proc = self._proc
+            return proc.pid if proc is not None and proc.poll() is None else None
+
     def close(self):
         with self._state_lock:
             self._closed = True

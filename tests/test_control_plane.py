@@ -6,6 +6,7 @@ import time
 import unittest
 
 from control_plane import ControlPlaneError, ZCodeControlPlane, extract_last_assistant_text
+from resource_leases import NullResourceLeaseStore
 
 
 def eventually(predicate, timeout=3):
@@ -29,6 +30,7 @@ class FakeProtocol:
         self.sessions = {}
         self.read_text = "done"
         self.background_jobs = []
+        self.cancel_background_succeeds = True
         self.usage = {
             "totalTokens": 130,
             "inputTokens": 100,
@@ -42,6 +44,8 @@ class FakeProtocol:
         self.agents = {"revision": 1, "childSessionIds": [], "running": [], "ended": {"total": 0, "items": []}}
         self.goal_error_after_start = None
         self.goal_terminal_before_response = False
+        self.send_errors = []
+        self.terminal_sets_idle = True
 
     def _snapshot(self, session_id):
         session = self.sessions[session_id]
@@ -94,6 +98,8 @@ class FakeProtocol:
                 session_id = params["sessionId"]
                 return {"sessionId": session_id, "eventSeq": self.sessions[session_id]["eventSeq"], "events": [], "snapshot": self._snapshot(session_id)}
             if method == "session/send":
+                if self.send_errors:
+                    raise self.send_errors.pop(0)
                 session = self.sessions[params["sessionId"]]
                 session["status"] = "running"
                 session["revision"] += 1
@@ -149,17 +155,22 @@ class FakeProtocol:
                 self.sessions[params["sessionId"]]["status"] = "idle"
                 return self._snapshot(params["sessionId"])
             if method == "session/cancelBackgroundTask":
-                for job in self.background_jobs:
-                    if job.get("taskId") == params["taskId"]:
-                        job["status"] = "cancelled"
-                return {"cancelled": True, "status": "cancelled", "taskId": params["taskId"]}
+                if self.cancel_background_succeeds:
+                    for job in self.background_jobs:
+                        if job.get("taskId") == params["taskId"]:
+                            job["status"] = "cancelled"
+                return {
+                    "cancelled": self.cancel_background_succeeds,
+                    "status": "cancelled" if self.cancel_background_succeeds else "running",
+                    "taskId": params["taskId"],
+                }
             return {"accepted": True}
 
     def close(self):
         return None
 
     def emit(self, session_id, kind, **detail):
-        if kind == "turn.terminal":
+        if kind == "turn.terminal" and self.terminal_sets_idle:
             self.sessions[session_id]["status"] = "idle"
         self.on_notification({
             "method": "v4/telemetry/event",
@@ -189,7 +200,13 @@ class FakeProtocol:
 class ControlPlaneTest(unittest.TestCase):
     def setUp(self):
         self.protocol = FakeProtocol()
-        self.control = ZCodeControlPlane(protocol=self.protocol, max_concurrency=0)
+        self.control = ZCodeControlPlane(
+            protocol=self.protocol,
+            max_concurrency=0,
+            lease_store=NullResourceLeaseStore(),
+            guidance_retry_seconds=0.2,
+            native_stop_wait_seconds=0.2,
+        )
 
     def start(self, prompt, cwd, *, access="exclusive", resources=None, **extra):
         args = {
@@ -323,6 +340,58 @@ class ControlPlaneTest(unittest.TestCase):
             },
         )
         self.assertEqual("decline", answer["action"])
+
+    def test_headless_permission_enforces_structured_workspace_paths(self):
+        run = self.start(
+            "implement",
+            "scope-policy",
+            mode="build",
+            resources=[{"key": "/tmp/scope-output", "mode": "exclusive"}],
+        )
+        session_id = self.session(run["runId"])
+        inside = self.protocol.on_server_request(
+            "interaction/requestPermission",
+            {
+                "sessionId": session_id,
+                "toolName": "Write",
+                "input": {"filePath": "/tmp/scope-policy/source.swift"},
+            },
+        )
+        declared = self.protocol.on_server_request(
+            "interaction/requestPermission",
+            {
+                "sessionId": session_id,
+                "toolName": "Write",
+                "input": {"filePath": "/tmp/scope-output/result.txt"},
+            },
+        )
+        outside = self.protocol.on_server_request(
+            "interaction/requestPermission",
+            {
+                "sessionId": session_id,
+                "toolName": "Write",
+                "input": {"filePath": "/tmp/unrelated-main-repo/result.txt"},
+            },
+        )
+        self.assertEqual("allow", inside["decision"])
+        self.assertEqual("allow", declared["decision"])
+        self.assertEqual("deny", outside["decision"])
+        policy = self.control.snapshot(run["runId"])["permissionPolicy"]
+        self.assertTrue(policy["structuredPathsEnforced"])
+        self.assertEqual("advisory", policy["shellBoundary"])
+
+    def test_shared_workspace_denies_structured_writes(self):
+        run = self.start("inspect", "shared-policy", mode="build", access="shared")
+        session_id = self.session(run["runId"])
+        permission = self.protocol.on_server_request(
+            "interaction/requestPermission",
+            {
+                "sessionId": session_id,
+                "toolName": "Edit",
+                "input": {"path": "/tmp/shared-policy/file.swift"},
+            },
+        )
+        self.assertEqual("deny", permission["decision"])
 
     def test_start_requires_exactly_one_prompt_or_goal(self):
         with self.assertRaises(ControlPlaneError):
@@ -466,6 +535,87 @@ class ControlPlaneTest(unittest.TestCase):
         self.protocol.emit(session_id, "turn.terminal", status="interrupted")
         self.assertTrue(eventually(lambda: self.control.snapshot(run_id)["status"] == "cancelled"))
 
+    def test_guidance_retries_native_prompt_busy_after_terminal(self):
+        run = self.start("first turn", "guidance-retry")
+        run_id = run["runId"]
+        session_id = self.session(run_id)
+        current = self.control.snapshot(run_id)
+        self.protocol.send_errors = [RuntimeError("A prompt is already running for this session")]
+        self.control.control(
+            run_id,
+            "guide",
+            prompt="second turn",
+            if_revision=current["revision"],
+            if_status=current["status"],
+        )
+        self.protocol.emit(session_id, "turn.terminal", status="success")
+        self.assertTrue(eventually(
+            lambda: self.control.snapshot(run_id)["phase"] == "guided-turn"
+        ))
+        self.assertEqual([], self.control.snapshot(run_id)["controlFailures"])
+        self.protocol.emit(session_id, "turn.terminal", status="success")
+        self.assertTrue(eventually(
+            lambda: self.control.snapshot(run_id)["status"] == "completed"
+        ))
+
+    def test_late_guidance_failure_does_not_overwrite_successful_turn(self):
+        run = self.start("successful work", "guidance-isolation")
+        run_id = run["runId"]
+        session_id = self.session(run_id)
+        self.protocol.send_errors = [
+            RuntimeError("A prompt is already running for this session") for _ in range(10)
+        ]
+        self.control.control(run_id, "guide", prompt="redundant guidance")
+        self.protocol.emit(session_id, "turn.terminal", status="success")
+        self.assertTrue(eventually(
+            lambda: self.control.snapshot(run_id)["status"] == "completed",
+            timeout=1,
+        ))
+        state = self.control.snapshot(run_id)
+        self.assertEqual("done", state["result"])
+        self.assertEqual(1, len(state["controlFailures"]))
+        self.assertNotEqual("guidance-failed", state["phase"])
+
+    def test_guidance_failure_retains_lease_when_native_is_still_running(self):
+        run = self.start("work", "guidance-native-busy")
+        run_id = run["runId"]
+        session_id = self.session(run_id)
+        self.protocol.send_errors = [
+            RuntimeError("A prompt is already running for this session") for _ in range(10)
+        ]
+        self.protocol.terminal_sets_idle = False
+        self.control.control(run_id, "guide", prompt="late")
+        self.protocol.emit(session_id, "turn.terminal", status="success")
+        self.assertTrue(eventually(
+            lambda: self.control.snapshot(run_id)["phase"] == "resource-cleanup-required",
+            timeout=1,
+        ))
+        state = self.control.snapshot(run_id)
+        self.assertEqual("failed", state["status"])
+        self.assertTrue(state["resourceLease"]["acquired"])
+        self.assertEqual(1, len(state["controlFailures"]))
+        self.assertEqual("closed", self.control.close_run(run_id)["status"])
+
+    def test_guidance_optimistic_guards_reject_stale_decisions(self):
+        run = self.start("active", "guidance-guard")
+        run_id = run["runId"]
+        self.session(run_id)
+        current = self.control.snapshot(run_id)
+        with self.assertRaisesRegex(ControlPlaneError, "snapshot is stale"):
+            self.control.control(
+                run_id,
+                "guide",
+                prompt="stale",
+                if_revision=current["revision"] - 1,
+            )
+        with self.assertRaisesRegex(ControlPlaneError, "status changed"):
+            self.control.control(
+                run_id,
+                "guide",
+                prompt="wrong status",
+                if_status="completed",
+            )
+
     def test_new_model_iteration_clears_completed_foreground_tools(self):
         run = self.start("iterations", "iterations")
         run_id = run["runId"]
@@ -495,6 +645,36 @@ class ControlPlaneTest(unittest.TestCase):
         self.assertEqual("completed", controlled["status"])
         self.assertTrue(controlled["controlResult"]["cancelled"])
         self.assertTrue(eventually(lambda: self.control.snapshot(second["runId"])["status"] == "running"))
+
+    def test_background_timeout_retains_lease_until_native_cleanup_is_confirmed(self):
+        self.protocol.background_jobs = [{
+            "taskId": "bg_stuck", "taskKind": "bash", "status": "running",
+            "cancellable": True, "command": "xcodebuild test",
+        }]
+        self.protocol.cancel_background_succeeds = False
+        first = self.start("background", "timeout-lock", timeout=1)
+        first_id = first["runId"]
+        session_id = self.session(first_id)
+        second = self.start("next writer", "timeout-lock")
+        self.protocol.emit(session_id, "turn.terminal", status="success")
+        self.assertTrue(eventually(
+            lambda: self.control.snapshot(first_id)["status"] == "background"
+        ))
+        self.assertTrue(eventually(
+            lambda: self.control.snapshot(first_id)["phase"] == "resource-cleanup-required",
+            timeout=2,
+        ))
+        first_state = self.control.snapshot(first_id)
+        self.assertEqual("failed", first_state["status"])
+        self.assertTrue(first_state["resourceLease"]["acquired"])
+        self.assertEqual("queued", self.control.snapshot(second["runId"])["status"])
+
+        self.protocol.cancel_background_succeeds = True
+        closed = self.control.close_run(first_id)
+        self.assertEqual("closed", closed["status"])
+        self.assertTrue(eventually(
+            lambda: self.control.snapshot(second["runId"])["status"] == "running"
+        ))
 
     def test_stale_terminal_projection_is_rechecked_once(self):
         self.protocol.background_jobs = [{

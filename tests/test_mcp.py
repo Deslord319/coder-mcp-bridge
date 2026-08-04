@@ -115,7 +115,7 @@ def main():
             "protocolVersion": "2025-03-26", "capabilities": {},
             "clientInfo": {"name": "zcode-live-test", "version": "1"},
         }, timeout=30)
-        require(initialized.get("result", {}).get("serverInfo", {}).get("version") == "0.3.0", "server version is 0.3.0")
+        require(initialized.get("result", {}).get("serverInfo", {}).get("version") == "0.4.0", "server version is 0.4.0")
         listed = client.request("tools/list", {}, timeout=30)
         names = [item["name"] for item in listed["result"]["tools"]]
         require(names == EXPECTED_TOOLS, "only the new aggregated tools are exposed", names)
@@ -168,6 +168,37 @@ def main():
             )
             require("prompt is already running" not in str(goal_final).lower(), "goal-only run has no double-start race")
             client.tool("zcode-close", {"runId": goal["runId"]}, timeout=30)
+
+        with tempfile.TemporaryDirectory(prefix="zcode-live-guidance-") as guidance_cwd:
+            guided_run = client.tool("zcode-start", {
+                "prompt": (
+                    "Use the Bash tool to run exactly `sleep 2`. Wait for it, then "
+                    "reply exactly GUIDANCE_FIRST."
+                ),
+                "cwd": guidance_cwd,
+                "mode": "yolo",
+                "thoughtLevel": "high",
+                "timeout": 120,
+            }, timeout=30)
+            guided = client.tool("zcode-control", {
+                "runId": guided_run["runId"],
+                "action": "guide",
+                "prompt": "After the current turn, reply exactly GUIDANCE_SECOND and use no tools.",
+            }, timeout=30)
+            guided_final = {}
+            wait_terminal(client, guided_run["runId"], guided, guided_final)
+            require(guided_final.get("status") == "completed", "queued guidance completed", guided_final)
+            require(
+                "GUIDANCE_SECOND" in guided_final.get("result", ""),
+                "queued guidance result is preserved",
+                guided_final,
+            )
+            require(
+                not guided_final.get("controlFailures"),
+                "native-ready guidance has no control failure",
+                guided_final,
+            )
+            client.tool("zcode-close", {"runId": guided_run["runId"]}, timeout=30)
 
         with tempfile.TemporaryDirectory(prefix="zcode-live-a-") as first_cwd, tempfile.TemporaryDirectory(prefix="zcode-live-b-") as second_cwd:
             prompt_a = "Use the Bash tool to run exactly `sleep 6`. Wait for it to finish, then reply exactly PARALLEL_A_DONE."

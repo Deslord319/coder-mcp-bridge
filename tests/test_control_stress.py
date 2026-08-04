@@ -5,6 +5,15 @@ import time
 import unittest
 
 from control_plane import ZCodeControlPlane
+from resource_leases import NullResourceLeaseStore
+
+
+def control_for(protocol, max_concurrency=0):
+    return ZCodeControlPlane(
+        protocol=protocol,
+        max_concurrency=max_concurrency,
+        lease_store=NullResourceLeaseStore(),
+    )
 
 
 def eventually(predicate, timeout=10):
@@ -115,7 +124,7 @@ class BlockingProtocol(AutoProtocol):
 class ControlStressTest(unittest.TestCase):
     def test_zero_limit_leaves_twenty_independent_runs_to_codex(self):
         protocol = AutoProtocol(duration=2)
-        control = ZCodeControlPlane(protocol=protocol, max_concurrency=0)
+        control = control_for(protocol, max_concurrency=0)
         runs = [control.start({"prompt": "parallel %s" % index, "cwd": "/tmp/codex-owned-%s" % index})["runId"] for index in range(20)]
         self.assertTrue(eventually(lambda: all(control.snapshot(run_id)["status"] == "running" for run_id in runs)))
         self.assertEqual(20, protocol.max_active)
@@ -123,7 +132,7 @@ class ControlStressTest(unittest.TestCase):
 
     def test_measured_wall_clock_proves_independent_runs_are_parallel(self):
         protocol = AutoProtocol(duration=0.08)
-        control = ZCodeControlPlane(protocol=protocol, max_concurrency=0)
+        control = control_for(protocol, max_concurrency=0)
         started = time.monotonic()
         runs = [control.start({"prompt": "parallel", "cwd": "/tmp/wall-%s" % index})["runId"] for index in range(8)]
         self.assertTrue(eventually(lambda: all(control.snapshot(run_id)["status"] == "completed" for run_id in runs)))
@@ -133,7 +142,7 @@ class ControlStressTest(unittest.TestCase):
 
     def test_one_hundred_runs_obey_optional_cap_and_worktree_locks(self):
         protocol = AutoProtocol(duration=0.004)
-        control = ZCodeControlPlane(protocol=protocol, max_concurrency=8)
+        control = control_for(protocol, max_concurrency=8)
         runs = [control.start({"prompt": "task %s" % index, "cwd": "/tmp/stress-worktree-%s" % (index % 10)})["runId"] for index in range(100)]
         self.assertTrue(eventually(lambda: all(control.snapshot(run_id)["status"] == "completed" for run_id in runs)))
         self.assertLessEqual(protocol.max_active, 8)
@@ -143,7 +152,7 @@ class ControlStressTest(unittest.TestCase):
 
     def test_thirty_two_waiters_wake_on_one_meaningful_event(self):
         protocol = AutoProtocol(duration=2)
-        control = ZCodeControlPlane(protocol=protocol, max_concurrency=1)
+        control = control_for(protocol, max_concurrency=1)
         run_id = control.start({"prompt": "wait", "cwd": "/tmp/waiters"})["runId"]
         self.assertTrue(eventually(lambda: control.snapshot(run_id)["status"] == "running"))
         revision = control.snapshot(run_id)["revision"]
@@ -168,7 +177,7 @@ class ControlStressTest(unittest.TestCase):
 
     def test_start_returns_while_native_session_open_is_blocked(self):
         protocol = BlockingProtocol()
-        control = ZCodeControlPlane(protocol=protocol, max_concurrency=1)
+        control = control_for(protocol, max_concurrency=1)
         started = time.monotonic()
         run = control.start({"prompt": "nonblocking", "cwd": "/tmp/nonblocking"})
         self.assertLess(time.monotonic() - started, 0.1)
