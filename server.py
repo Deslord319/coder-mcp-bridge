@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
-"""
-ZCode MCP server — expose ZCode as an agent to any MCP client.
+"""Event-driven ZCode scheduling bridge for MCP clients.
 
-Mirrors `codex mcp-server` (which exposes the `codex` and `codex-reply` tools)
-with two equivalent tools backed by ZCode's headless CLI:
-
-  * `zcode`       — run a ZCode session (new conversation)
-  * `zcode-reply` — continue a ZCode session by threadId
-
-Backed by ZCode's bundled CLI (`glm/zcode.cjs` inside ZCode.app), driven through
-the bundled Electron runtime with `ELECTRON_RUN_AS_NODE=1`, so the server needs
-no separate Node.js/Python dependencies at runtime.
+The bridge uses ZCode's persistent app-server protocol.  It exposes compact
+run state and control operations while keeping raw model streams and native
+session snapshots private.  Codex owns global concurrency; the bridge only
+serializes declared worktree and resource conflicts.
 
 Requirements
 ------------
@@ -30,29 +24,25 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
 import threading
 import time
 import traceback
+from control_plane import ControlPlaneError, ZCodeControlPlane
+from zcode_protocol import ProtocolError
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 TIMEOUT_DEFAULT = int(os.environ.get("ZCODE_MCP_TIMEOUT", "900") or 900)      # seconds per tool call
-MAX_CONCURRENCY = int(os.environ.get("ZCODE_MCP_MAX_CONCURRENCY", "2") or 2)  # parallel ZCode sessions
+# Zero means the MCP client owns global scheduling. The bridge still serializes
+# conflicting sessions/worktrees/resources; a positive env override is only an
+# optional operator safety cap.
+MAX_CONCURRENCY = int(os.environ.get("ZCODE_MCP_MAX_CONCURRENCY", "0") or 0)
 PROTOCOL_VERSION = "2025-03-26"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.3.0"
 STDERR_LOG = os.environ.get("ZCODE_MCP_LOG", "")
-
-MODES = ("build", "edit", "plan", "yolo", "auto")
-
-# Options advertised in `zcode --help` but NOT implemented by the 0.16.1
-# argument parser (passing them aborts with exit code 1). Accepted in tool
-# schemas for API compatibility but ignored at runtime.
-UNSUPPORTED_OPTIONS = {"max-turns", "allowed-tools", "settings", "permission-mode"}
-
 
 def _log(msg: str) -> None:
     if STDERR_LOG:
@@ -107,149 +97,6 @@ def discover_zcode():
         if not p or not os.path.isfile(p):
             raise RuntimeError("%s not found at %s" % (label, p))
     return binary, bundle
-
-
-# ---------------------------------------------------------------------------
-# ZCode session runner
-# ---------------------------------------------------------------------------
-
-class SessionError(RuntimeError):
-    def __init__(self, message, code="zcode_error", data=None):
-        super().__init__(message)
-        self.message = message
-        self.code = code
-        self.data = data or {}
-
-
-def _extract_json(text: str):
-    """Return the last complete top-level JSON object found in `text`."""
-    t = text.strip()
-    try:
-        obj = json.loads(t)
-        if isinstance(obj, dict):
-            return obj
-    except (json.JSONDecodeError, ValueError):
-        pass
-    depth = 0
-    start = None
-    last_obj = None
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and start is not None:
-                candidate = text[start:i + 1]
-                try:
-                    obj = json.loads(candidate)
-                    if isinstance(obj, dict):
-                        last_obj = obj
-                except (json.JSONDecodeError, ValueError):
-                    pass
-                start = None
-    return last_obj
-
-
-def run_zcode(prompt, *, thread_id=None, cwd=None, mode="yolo",
-              max_turns=None, allowed_tools=None, disallowed_tools=None,
-              timeout=None, zcode_bin=None, zcode_bundle=None):
-    """Run a ZCode headless session; return the parsed result dict.
-
-    Mirrors `codex mcp-server`'s `codex`/`codex-reply` tools:
-      * thread_id set  -> `zcode --resume <thread_id> --prompt ...`  (reply)
-      * thread_id None -> `zcode --prompt ...`                       (new session)
-    """
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise SessionError("prompt must be a non-empty string", code="invalid_params")
-    if not zcode_bin or not zcode_bundle:
-        raise SessionError("ZCode runtime not initialized", code="zcode_not_found")
-
-    cmd = [zcode_bin, zcode_bundle, "--prompt", prompt, "--json", "--no-color"]
-    if thread_id:
-        cmd += ["--resume", thread_id]
-    if cwd:
-        cmd += ["--cwd", cwd]
-    if mode and mode in MODES:
-        cmd += ["--mode", mode]
-
-    def _to_list(v):
-        if v is None:
-            return None
-        if isinstance(v, list):
-            return [str(x) for x in v]
-        return [str(v)]
-
-    dt = _to_list(disallowed_tools)
-    if dt:
-        # --disallowed-tools is a real flag; --max-turns/--allowed-tools are
-        # advertised but rejected by the 0.16.1 parser, so they are ignored.
-        cmd += ["--disallowed-tools", ",".join(dt)]
-
-    env = dict(os.environ)
-    env["ELECTRON_RUN_AS_NODE"] = "1"
-    env["NO_COLOR"] = "1"
-    # Always use the provider/model selected by the ZCode CLI config. A model
-    # override can select a different provider target without its credentials.
-    env.pop("ZCODE_MODEL", None)
-
-    timeout = timeout or TIMEOUT_DEFAULT
-    _log(
-        "RUN binary=%s bundle=%s resume=%s cwd=%s mode=%s prompt_chars=%s"
-        % (zcode_bin, zcode_bundle, bool(thread_id), cwd or "", mode or "", len(prompt))
-    )
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-    )
-    try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        try:
-            proc.communicate(timeout=10)
-        except Exception:
-            proc.terminate()
-        raise SessionError(
-            "ZCode session timed out after %ss" % timeout, code="timeout"
-        )
-
-    _log(
-        "RAW EXIT %s out_type=%s out_len=%s err_type=%s err_len=%s"
-        % (
-            proc.returncode,
-            type(out).__name__,
-            len(out) if out is not None else "none",
-            type(err).__name__,
-            len(err) if err is not None else "none",
-        )
-    )
-    # Electron on Windows can leave one redirected stream as None even when
-    # communicate() completes successfully. Normalize both streams before
-    # logging lengths or slicing error output.
-    out = out or ""
-    err = err or ""
-    _log("EXIT %s out=%s err=%s" % (proc.returncode, len(out), len(err)))
-    if proc.returncode != 0:
-        raise SessionError(
-            "ZCode exited with code %s: %s" % (proc.returncode, (err or out)[-2000:]),
-            code="zcode_exit_error",
-        )
-    result = _extract_json(out)
-    if not result:
-        raise SessionError(
-            "ZCode produced no parseable JSON output",
-            code="parse_error",
-            data={"stdout": out[-2000:], "stderr": err[-2000:]},
-        )
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -340,98 +187,163 @@ def ensure_cli_config(cli_config_path=None, desktop_config_path=None):
 # MCP (JSON-RPC 2.0 over stdio) server
 # ---------------------------------------------------------------------------
 
-ZCODE_TOOL_SCHEMA = {
+RUN_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "runId": {"type": "string"},
+        "status": {"type": "string"},
+        "revision": {"type": "integer"},
+        "threadId": {"type": ["string", "null"]},
+        "phase": {"type": "string"},
+        "elapsedMs": {"type": "integer"},
+        "result": {"type": "string"},
+    },
+    "required": ["runId", "status", "revision"],
+    "additionalProperties": True,
+}
+
+ZCODE_START_SCHEMA = {
     "type": "object",
     "properties": {
         "prompt": {
             "type": "string",
-            "description": "The initial user prompt to start the ZCode conversation.",
+            "description": "One coherent one-turn task. Mutually exclusive with goal because native goal creation starts its own turn.",
         },
-        "threadId": {
-            "type": "string",
-            "description": "Existing ZCode session id (sess_...) to resume instead of starting a new conversation.",
-        },
-        "cwd": {
-            "type": "string",
-            "description": "Working directory for the session.",
-        },
-        "sandbox": {
-            "type": "string",
-            "enum": ["read-only", "workspace-write", "danger-full-access"],
-            "description": "Maps to ZCode permission mode: read-only -> plan, workspace-write -> build, danger-full-access -> yolo.",
-        },
+        "threadId": {"type": "string", "description": "Continue an existing session on its bound worktree."},
+        "cwd": {"type": "string", "description": "Task worktree or working directory."},
         "mode": {
             "type": "string",
-            "enum": ["build", "edit", "plan", "yolo"],
-            "description": "ZCode permission mode for the session (default yolo).",
+            "enum": ["build", "edit", "plan", "yolo", "auto"],
+            "description": "Execution mode. In managed headless build/edit/auto runs, Codex authorizes ZCode tool and implementation-plan permission requests; arbitrary user questions are declined. Native durable goals cannot use plan.",
         },
-        "maxTurns": {
-            "type": "integer",
-            "description": "Maximum model turns for the session. NOTE: accepted for compatibility; ignored by ZCode CLI 0.16.1 (flag not implemented).",
+        "thoughtLevel": {"type": "string", "enum": ["high", "max"]},
+        "model": {
+            "type": "object",
+            "properties": {"providerId": {"type": "string"}, "modelId": {"type": "string"}},
+            "required": ["providerId", "modelId"],
+            "additionalProperties": False,
         },
-        "allowedTools": {
+        "toolAllowlist": {"type": "array", "items": {"type": "string"}},
+        "toolDenylist": {"type": "array", "items": {"type": "string"}},
+        "workspaceAccess": {"type": "string", "enum": ["shared", "exclusive"], "default": "exclusive"},
+        "resources": {
             "type": "array",
-            "items": {"type": "string"},
-            "description": "Tool allowlist, e.g. ['Bash', 'Read', 'Edit']. NOTE: accepted for compatibility; ignored by ZCode CLI 0.16.1 (flag not implemented).",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["shared", "exclusive"], "default": "exclusive"},
+                },
+                "required": ["key"],
+                "additionalProperties": False,
+            },
+            "description": "Additional conflict domains such as simulator or DerivedData. Codex owns global concurrency.",
         },
-        "disallowedTools": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Tool denylist, e.g. ['Bash(git push *)']. Passed through as --disallowed-tools.",
+        "goal": {
+            "type": "string",
+            "description": "One durable native objective. Mutually exclusive with prompt; setting a native goal starts the run.",
         },
-        "timeout": {
-            "type": "integer",
-            "description": "Timeout in seconds (default %s, ZCODE_MCP_TIMEOUT)." % TIMEOUT_DEFAULT,
-        },
+        "timeout": {"type": "integer", "minimum": 1, "maximum": 86400, "default": TIMEOUT_DEFAULT, "description": "Whole-run timeout in seconds."},
     },
-    "required": ["prompt"],
+    "oneOf": [
+        {"required": ["prompt"], "not": {"required": ["goal"]}},
+        {"required": ["goal"], "not": {"required": ["prompt"]}},
+    ],
+    "allOf": [
+        {
+            "if": {"required": ["goal"]},
+            "then": {
+                "properties": {
+                    "mode": {"enum": ["build", "edit", "yolo", "auto"]},
+                }
+            },
+        }
+    ],
+    "additionalProperties": False,
 }
 
-ZCODE_REPLY_TOOL_SCHEMA = {
+ZCODE_WAIT_SCHEMA = {
     "type": "object",
     "properties": {
-        "threadId": {
-            "type": "string",
-            "description": "The ZCode session id (sess_...) to continue.",
-        },
-        "prompt": {
-            "type": "string",
-            "description": "The next user prompt to continue the ZCode conversation.",
-        },
-        "cwd": {
-            "type": "string",
-            "description": "Working directory for the session.",
-        },
-        "mode": {
-            "type": "string",
-            "enum": ["build", "edit", "plan", "yolo"],
-            "description": "ZCode permission mode for the session.",
-        },
-        "maxTurns": {
-            "type": "integer",
-            "description": "Maximum model turns for the session. NOTE: accepted for compatibility; ignored by ZCode CLI 0.16.1 (flag not implemented).",
-        },
-        "timeout": {
-            "type": "integer",
-            "description": "Timeout in seconds (default %s)." % TIMEOUT_DEFAULT,
-        },
+        "runId": {"type": "string"},
+        "afterRevision": {"type": "integer", "minimum": 0, "default": 0},
+        "timeoutMs": {"type": "integer", "minimum": 0, "maximum": 60000, "default": 30000},
+        "resultChars": {"type": "integer", "minimum": 0, "maximum": 12000, "default": 2000},
     },
-    "required": ["threadId", "prompt"],
+    "required": ["runId"],
+    "additionalProperties": False,
 }
 
-OUTPUT_SCHEMA = {
+ZCODE_OBSERVE_SCHEMA = {
     "type": "object",
     "properties": {
-        "threadId": {"type": "string"},
-        "content": {"type": "string"},
+        "runId": {"type": "string"},
+        "afterSeq": {"type": "integer", "minimum": 0, "default": 0},
+        "refresh": {"type": "boolean", "default": True},
+        "maxEvents": {"type": "integer", "minimum": 0, "maximum": 30, "default": 12},
+        "resultChars": {"type": "integer", "minimum": 0, "maximum": 12000, "default": 2000},
     },
-    "required": ["threadId", "content"],
+    "required": ["runId"],
+    "additionalProperties": False,
 }
 
-SANDBOX_TO_MODE = {
-    "read-only": "plan",
-    "workspace-write": "build",
-    "danger-full-access": "yolo",
+ZCODE_CONTROL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "runId": {"type": "string"},
+        "action": {
+            "type": "string",
+            "enum": ["guide", "interrupt", "cancel", "cancel-background", "pause-goal", "resume-goal"],
+        },
+        "prompt": {"type": "string", "description": "Required for guide or interrupt."},
+        "taskId": {"type": "string", "description": "Required for cancel-background."},
+    },
+    "required": ["runId", "action"],
+    "additionalProperties": False,
+}
+
+ZCODE_RECOVER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "adoptThreadId": {"type": "string", "description": "Adopt one persisted session into a managed run; omit to list candidates."},
+        "workspace": {"type": "string"},
+        "cwd": {"type": "string"},
+        "includeArchived": {"type": "boolean", "default": False},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+        "workspaceAccess": {"type": "string", "enum": ["shared", "exclusive"], "default": "exclusive"},
+        "resources": ZCODE_START_SCHEMA["properties"]["resources"],
+    },
+    "additionalProperties": False,
+}
+
+ZCODE_BRANCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "runId": {"type": "string"},
+        "targetKind": {"type": "string", "enum": ["latestCheckpoint", "checkpoint", "message", "turn"], "default": "latestCheckpoint"},
+        "targetId": {"type": "string"},
+        "turnIndex": {"type": "integer", "minimum": 0},
+    },
+    "required": ["runId"],
+    "additionalProperties": False,
+}
+
+ZCODE_CONTEXT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "runId": {"type": "string"},
+        "action": {"type": "string", "enum": ["inspect", "compact"], "default": "inspect"},
+        "instructions": {"type": "string"},
+    },
+    "required": ["runId"],
+    "additionalProperties": False,
+}
+
+ZCODE_CLOSE_SCHEMA = {
+    "type": "object",
+    "properties": {"runId": {"type": "string"}, "threadId": {"type": "string"}},
+    "anyOf": [{"required": ["runId"]}, {"required": ["threadId"]}],
+    "additionalProperties": False,
 }
 
 
@@ -440,8 +352,20 @@ class ZCodeMcpServer:
         self.zcode_bin = zcode_bin
         self.zcode_bundle = zcode_bundle
         self._write_lock = threading.Lock()
-        self._sem = threading.Semaphore(MAX_CONCURRENCY)
-        self._calls = {}  # request_id -> {"proc": Popen or None, "cancel": Event}
+        self._calls = {}  # request_id -> cancellation Event
+        self._control = None
+        self._control_lock = threading.Lock()
+
+    def _control_plane(self):
+        with self._control_lock:
+            if self._control is None:
+                self._control = ZCodeControlPlane(
+                    self.zcode_bin,
+                    self.zcode_bundle,
+                    max_concurrency=MAX_CONCURRENCY,
+                    logger=_log,
+                )
+            return self._control
 
     # -- transport ----------------------------------------------------------
 
@@ -478,26 +402,78 @@ class ZCodeMcpServer:
     def handle_tools_list(self, request_id):
         tools = [
             {
-                "name": "zcode",
-                "title": "ZCode",
+                "name": "zcode-start",
+                "title": "Start ZCode Run",
                 "description": (
-                    "Run a ZCode session. Starts a new ZCode conversation with the "
-                    "given prompt (pass threadId to resume an existing session). "
-                    "ZCode is a coding agent that can read/write files, run shell "
-                    "commands, search code, and use MCP tools."
+                    "Start one non-blocking ZCode task using exactly one of prompt (one turn) or goal (durable). "
+                    "Codex owns global concurrency; independent worktrees "
+                    "and resources run concurrently while conflicting exclusive resources queue. Continue "
+                    "with zcode-wait instead of polling or sleeping."
                 ),
-                "inputSchema": ZCODE_TOOL_SCHEMA,
-                "outputSchema": OUTPUT_SCHEMA,
+                "inputSchema": ZCODE_START_SCHEMA,
+                "outputSchema": RUN_OUTPUT_SCHEMA,
             },
             {
-                "name": "zcode-reply",
-                "title": "ZCode Reply",
+                "name": "zcode-wait",
+                "title": "Wait for ZCode Progress",
                 "description": (
-                    "Continue a ZCode conversation by providing the thread id "
-                    "(the sessionId returned by a previous zcode call) and a prompt."
+                    "Preferred progress path. Wait for a meaningful revision or terminal state; pass the "
+                    "last revision as afterRevision. Native subscriptions and replay drive revisions; a "
+                    "timeout means unchanged state, not failure."
                 ),
-                "inputSchema": ZCODE_REPLY_TOOL_SCHEMA,
-                "outputSchema": OUTPUT_SCHEMA,
+                "inputSchema": ZCODE_WAIT_SCHEMA,
+                "outputSchema": RUN_OUTPUT_SCHEMA,
+            },
+            {
+                "name": "zcode-observe",
+                "title": "Observe ZCode Run",
+                "description": (
+                    "Read compact model/reasoning activity, exact usage, background tasks, subagents, context, "
+                    "goal, checkpoints and bounded events. Raw streams and full snapshots remain private."
+                ),
+                "inputSchema": ZCODE_OBSERVE_SCHEMA,
+                "outputSchema": RUN_OUTPUT_SCHEMA,
+            },
+            {
+                "name": "zcode-control",
+                "title": "Control ZCode Run",
+                "description": (
+                    "Guide after the current turn, interrupt and guide, cancel a run or one native background "
+                    "task, and pause/resume a durable goal. Guidance is never represented as mid-turn injection."
+                ),
+                "inputSchema": ZCODE_CONTROL_SCHEMA,
+                "outputSchema": RUN_OUTPUT_SCHEMA,
+            },
+            {
+                "name": "zcode-recover",
+                "title": "Recover ZCode Session",
+                "description": (
+                    "List persisted ZCode sessions or adopt one after a bridge restart. Adoption resumes the "
+                    "native session, restores event replay and reacquires declared resource leases."
+                ),
+                "inputSchema": ZCODE_RECOVER_SCHEMA,
+                "outputSchema": {"type": "object", "additionalProperties": True},
+            },
+            {
+                "name": "zcode-branch",
+                "title": "Branch ZCode Session",
+                "description": "Fork an idle session from a turn, message, workspace checkpoint, or latest checkpoint.",
+                "inputSchema": ZCODE_BRANCH_SCHEMA,
+                "outputSchema": {"type": "object", "additionalProperties": True},
+            },
+            {
+                "name": "zcode-context",
+                "title": "Inspect or Compact Context",
+                "description": "Inspect native context/cache pressure or compact an idle session without lowering reasoning quality.",
+                "inputSchema": ZCODE_CONTEXT_SCHEMA,
+                "outputSchema": {"type": "object", "additionalProperties": True},
+            },
+            {
+                "name": "zcode-close",
+                "title": "Close ZCode Session",
+                "description": "Release a terminal ZCode session runtime after results, branching and compaction are no longer needed.",
+                "inputSchema": ZCODE_CLOSE_SCHEMA,
+                "outputSchema": {"type": "object", "additionalProperties": True},
             },
         ]
         self.send_response(request_id, {"tools": tools})
@@ -505,7 +481,10 @@ class ZCodeMcpServer:
     def handle_tools_call(self, request_id, params):
         name = params.get("name")
         args = params.get("arguments") or {}
-        if name not in ("zcode", "zcode-reply"):
+        if name not in {
+            "zcode-start", "zcode-wait", "zcode-observe", "zcode-control",
+            "zcode-recover", "zcode-branch", "zcode-context", "zcode-close",
+        }:
             self.send_error(request_id, -32602, "Unknown tool: %s" % name)
             return
         threading.Thread(
@@ -515,23 +494,27 @@ class ZCodeMcpServer:
     # -- tool execution ------------------------------------------------------
 
     def _run_tool(self, request_id, name, args):
-        proc_ref = {"proc": None}
         cancel = threading.Event()
-        self._calls[request_id] = (proc_ref, cancel)
+        self._calls[request_id] = cancel
         try:
-            with self._sem:
-                if cancel.is_set():
-                    raise SessionError("cancelled", code="cancelled")
-                result = self._execute(name, args, proc_ref)
-            self.send_response(request_id, {
-                "content": [{"type": "text", "text": result}],
+            result = self._execute_control(name, args)
+            response = {
+                "content": [{
+                    "type": "text",
+                    "text": result if isinstance(result, str) else json.dumps(
+                        result, ensure_ascii=False, separators=(",", ":")
+                    ),
+                }],
                 "isError": False,
-            })
-        except SessionError as e:
+            }
+            if isinstance(result, dict):
+                response["structuredContent"] = result
+            self.send_response(request_id, response)
+        except (ControlPlaneError, ProtocolError) as e:
             self.send_response(request_id, {
                 "content": [{
                     "type": "text",
-                    "text": "[zcode-error:%s] %s" % (e.code, e.message),
+                    "text": "[zcode-error:%s] %s" % (getattr(e, "code", "protocol"), getattr(e, "message", str(e))),
                 }],
                 "isError": True,
             })
@@ -544,69 +527,57 @@ class ZCodeMcpServer:
         finally:
             self._calls.pop(request_id, None)
 
-    def _execute(self, name, args, proc_ref):
-        if name == "zcode":
-            prompt = args.get("prompt", "")
-            thread_id = args.get("threadId")
-            kwargs = self._common_kwargs(args)
-        else:
-            prompt = args.get("prompt", "")
-            thread_id = args.get("threadId")
-            kwargs = self._common_kwargs(args)
-            if not thread_id:
-                raise SessionError(
-                    "threadId is required for zcode-reply", code="invalid_params"
-                )
-
-        mode = args.get("mode")
-        sandbox = args.get("sandbox")
-        if not mode and sandbox in SANDBOX_TO_MODE:
-            mode = SANDBOX_TO_MODE[sandbox]
-        kwargs["mode"] = mode or "yolo"
-
-        result = run_zcode(
-            prompt,
-            thread_id=thread_id,
-            cwd=args.get("cwd"),
-            mode=kwargs["mode"],
-            max_turns=args.get("maxTurns"),
-            timeout=args.get("timeout"),
-            zcode_bin=self.zcode_bin,
-            zcode_bundle=self.zcode_bundle,
-        )
-        return self._format_result(result)
-
-    @staticmethod
-    def _common_kwargs(args):
-        return {}
-
-    @staticmethod
-    def _format_result(result):
-        response = result.get("response", "")
-        meta = {
-            "threadId": result.get("sessionId"),
-            "traceId": result.get("traceId"),
-            "turnId": result.get("turnId"),
-            "usage": result.get("usage"),
-            "projection": result.get("projection"),
-        }
-        return "%s\n\n--- zcode metadata ---\n%s" % (
-            response,
-            json.dumps(meta, ensure_ascii=False, indent=2),
-        )
+    def _execute_control(self, name, args):
+        control = self._control_plane()
+        if name == "zcode-start":
+            mapped = dict(args)
+            mapped.setdefault("timeout", TIMEOUT_DEFAULT)
+            return control.start(mapped)
+        if name == "zcode-wait":
+            return control.wait(
+                args.get("runId", ""),
+                after_revision=args.get("afterRevision", 0),
+                timeout_ms=args.get("timeoutMs", 30000),
+                result_chars=args.get("resultChars", 2000),
+            )
+        if name == "zcode-observe":
+            return control.observe(
+                args.get("runId", ""),
+                refresh=args.get("refresh", True),
+                after_seq=args.get("afterSeq", 0),
+                max_events=args.get("maxEvents", 12),
+                result_chars=args.get("resultChars", 2000),
+            )
+        if name == "zcode-control":
+            return control.control(
+                args.get("runId", ""), args.get("action", ""),
+                prompt=args.get("prompt"), task_id=args.get("taskId"),
+            )
+        if name == "zcode-recover":
+            return control.recover(args)
+        if name == "zcode-branch":
+            return control.branch(
+                args.get("runId", ""),
+                target_kind=args.get("targetKind", "latestCheckpoint"),
+                target_id=args.get("targetId"),
+                turn_index=args.get("turnIndex"),
+            )
+        if name == "zcode-context":
+            return control.context(
+                args.get("runId", ""), action=args.get("action", "inspect"),
+                instructions=args.get("instructions"),
+            )
+        if name == "zcode-close":
+            return control.close_run(args.get("runId"), thread_id=args.get("threadId"))
+        raise ControlPlaneError("unknown control tool: %s" % name, "invalid_params")
 
     # -- cancellation --------------------------------------------------------
 
     def _cancel(self, request_id):
-        entry = self._calls.get(request_id)
-        if not entry:
+        cancel = self._calls.get(request_id)
+        if not cancel:
             return
-        proc_ref, cancel = entry
         cancel.set()
-        proc = proc_ref.get("proc")
-        if proc and proc.poll() is None:
-            _log("cancelling request %s (pid %s)" % (request_id, proc.pid))
-            proc.kill()
 
     # -- main loop -----------------------------------------------------------
 
@@ -640,18 +611,22 @@ class ZCodeMcpServer:
         _log("zcode_bin=%s" % self.zcode_bin)
         _log("zcode_bundle=%s" % self.zcode_bundle)
         _log("max_concurrency=%s timeout=%s" % (MAX_CONCURRENCY, TIMEOUT_DEFAULT))
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            try:
-                self.dispatch(msg)
-            except Exception as e:  # noqa: BLE001
-                _log("dispatch error: %s\n%s" % (e, traceback.format_exc()))
+        try:
+            for line in sys.stdin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                try:
+                    self.dispatch(msg)
+                except Exception as e:  # noqa: BLE001
+                    _log("dispatch error: %s\n%s" % (e, traceback.format_exc()))
+        finally:
+            if self._control is not None:
+                self._control.close()
 
 
 def main(argv):

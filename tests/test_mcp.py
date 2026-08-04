@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
-"""Integration tests for zcode-mcp-plugin/server.py.
+"""Live MCP integration and real ZCode concurrency test.
 
-Spawns the MCP server over stdio and exercises the full protocol:
-handshake, tool listing, new sessions, session resume, complex tasks,
-error handling, concurrency, and a stability loop.
-
-Run:
-    python3 tests/test_mcp.py            # full suite
-    python3 tests/test_mcp.py --fast     # skip complex + stability loops
+This test starts the bridge over stdio, launches two independent ZCode sessions,
+and verifies that both native Bash sleep operations are active at the same time.
 """
 
 from __future__ import annotations
@@ -16,312 +11,223 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER = os.path.join(os.path.dirname(HERE), "server.py")
-
-PASS = 0
-FAIL = 0
-FAILURES = []
-
-
-def check(name, cond, detail=""):
-    global PASS, FAIL
-    if cond:
-        PASS += 1
-        print("  PASS  %s" % name)
-    else:
-        FAIL += 1
-        FAILURES.append((name, detail))
-        print("  FAIL  %s  %s" % (name, ("(" + str(detail) + ")") if detail else ""))
+EXPECTED_TOOLS = [
+    "zcode-start", "zcode-wait", "zcode-observe", "zcode-control",
+    "zcode-recover", "zcode-branch", "zcode-context", "zcode-close",
+]
 
 
 class McpClient:
-    """Minimal newline-delimited JSON-RPC client for testing the server."""
-
-    def __init__(self, extra_env=None):
+    def __init__(self):
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
-        if extra_env:
-            env.update(extra_env)
         self.proc = subprocess.Popen(
             [sys.executable, SERVER],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
         )
         self._next_id = 0
+        self._write_lock = threading.Lock()
         self._lock = threading.Lock()
-        self._cv = threading.Condition()
-        self._pending = {}   # id -> threading.Event
-        self._results = {}   # id -> response dict
-        self._reader = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader.start()
+        self._pending = {}
+        threading.Thread(target=self._read_loop, daemon=True).start()
 
     def _read_loop(self):
         for line in self.proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
             try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
+                message = json.loads(line)
+            except (TypeError, ValueError):
                 continue
-            if "id" not in msg:
-                continue
-            with self._cv:
-                ev = self._pending.get(msg["id"])
-                if ev is not None:
-                    self._results[msg["id"]] = msg
-                    ev.set()
-                    self._cv.notify_all()
+            request_id = message.get("id")
+            with self._lock:
+                entry = self._pending.get(request_id)
+                if entry:
+                    entry["message"] = message
+                    entry["event"].set()
 
-    def request(self, method, params=None, timeout=600):
-        with self._lock:
+    def request(self, method, params=None, timeout=120):
+        with self._write_lock:
             self._next_id += 1
-            rid = self._next_id
-        payload = {"jsonrpc": "2.0", "id": rid, "method": method}
-        if params is not None:
-            payload["params"] = params
-        ev = threading.Event()
-        with self._cv:
-            self._pending[rid] = ev
-        with self._lock:
+            request_id = self._next_id
+            event = threading.Event()
+            with self._lock:
+                self._pending[request_id] = {"event": event, "message": None}
+            payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
+            if params is not None:
+                payload["params"] = params
             self.proc.stdin.write(json.dumps(payload) + "\n")
             self.proc.stdin.flush()
-        if not ev.wait(timeout):
-            with self._cv:
-                self._pending.pop(rid, None)
-            raise TimeoutError("no response for request %s within %ss" % (rid, timeout))
-        with self._cv:
-            self._pending.pop(rid, None)
-            return self._results.pop(rid)
+        if not event.wait(timeout):
+            raise TimeoutError("MCP request %s timed out" % method)
+        with self._lock:
+            entry = self._pending.pop(request_id)
+        return entry["message"]
+
+    def tool(self, name, arguments, timeout=120):
+        message = self.request("tools/call", {"name": name, "arguments": arguments}, timeout=timeout)
+        result = message.get("result") or {}
+        if result.get("isError"):
+            text = (result.get("content") or [{}])[0].get("text")
+            raise RuntimeError("%s failed: %s" % (name, text))
+        return result.get("structuredContent") or json.loads(result["content"][0]["text"])
 
     def close(self):
         try:
             self.proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            self.proc.terminate()
             self.proc.wait(timeout=5)
         except Exception:
+            self.proc.terminate()
             try:
-                self.proc.kill()
+                self.proc.wait(timeout=5)
             except Exception:
-                pass
+                self.proc.kill()
 
 
-def section(title):
-    print("\n== %s ==" % title)
+def require(condition, message, detail=None):
+    if not condition:
+        raise AssertionError("%s%s" % (message, ": %r" % detail if detail is not None else ""))
+    print("PASS", message)
 
 
-def test_handshake(c):
-    section("protocol handshake")
-    r = c.request("initialize", {
-        "protocolVersion": "2025-03-26",
-        "capabilities": {},
-        "clientInfo": {"name": "zcode-test", "version": "1.0"},
-    }, timeout=30)
-    res = r.get("result")
-    check("initialize returns serverInfo",
-          res and res.get("serverInfo", {}).get("name") == "zcode-mcp-server", r)
-    check("initialize returns protocol version", res and "protocolVersion" in res, r)
-    c.request("notifications/initialized")
-
-    r = c.request("ping", {}, timeout=30)
-    check("ping ok", r.get("result") == {}, r)
-
-    r = c.request("tools/list", {}, timeout=30)
-    tools = (r.get("result") or {}).get("tools") or []
-    names = [t["name"] for t in tools]
-    check("tools/list has zcode", "zcode" in names, names)
-    check("tools/list has zcode-reply", "zcode-reply" in names, names)
-    zcode_schema = next((t for t in tools if t["name"] == "zcode"), {})
-    check("zcode inputSchema requires prompt",
-          "prompt" in zcode_schema.get("inputSchema", {}).get("required", []), tools)
-    check("zcode inputSchema has no model override",
-          "model" not in zcode_schema.get("inputSchema", {}).get("properties", {}), tools)
-    reply_schema = next((t for t in tools if t["name"] == "zcode-reply"), {})
-    check("zcode-reply inputSchema has no model override",
-          "model" not in reply_schema.get("inputSchema", {}).get("properties", {}), tools)
-    return tools
-
-
-def test_new_session(c):
-    section("zcode tool: new session")
-    r = c.request("tools/call", {
-        "name": "zcode",
-        "arguments": {"prompt": "Reply with exactly: MCP_ZCODE_OK"},
-    }, timeout=300)
-    res = r.get("result") or {}
-    content = res.get("content") or []
-    text = content[0]["text"] if content else ""
-    check("isError false", res.get("isError") is False, res)
-    check("reply contains MCP_ZCODE_OK", "MCP_ZCODE_OK" in text, text[:300])
-    thread_id = _extract_thread_id(text)
-    check("metadata has threadId", bool(thread_id), text[:500])
-    return thread_id
-
-
-def _extract_thread_id(text):
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith('"threadId"') or stripped.startswith("threadId"):
-            val = stripped.split(":", 1)[-1].strip().strip('",')
-            if val.startswith("sess_"):
-                return val
-    return None
-
-
-def test_reply(c, thread_id):
-    section("zcode-reply tool: resume session")
-    if not thread_id:
-        check("zcode-reply skipped (no threadId)", False, "no threadId from previous test")
-        return
-    r = c.request("tools/call", {
-        "name": "zcode-reply",
-        "arguments": {"threadId": thread_id, "prompt": "Now reply with exactly: MCP_ZCODE_REPLY_OK"},
-    }, timeout=300)
-    res = r.get("result") or {}
-    content = res.get("content") or []
-    text = content[0]["text"] if content else ""
-    check("reply isError false", res.get("isError") is False, res)
-    check("reply continues same session", "MCP_ZCODE_REPLY_OK" in text, text[:300])
-    check("reply threadId matches", _extract_thread_id(text) == thread_id, text[:300])
-
-
-def test_complex_task(c):
-    section("zcode tool: complex task with tool use")
-    workdir = "/tmp/zcode-mcp-plugin-work"
-    os.makedirs(workdir, exist_ok=True)
-    marker = os.path.join(workdir, "mcp-result.txt")
-    if os.path.exists(marker):
-        os.remove(marker)
-    r = c.request("tools/call", {
-        "name": "zcode",
-        "arguments": {
-            "prompt": (
-                "In %s, create a file named mcp-result.txt containing the text "
-                "'complex-ok'. Then run `ls -la %s` and report the file size. "
-                "Finish your reply with the token DONE_COMPLEX." % (workdir, workdir)
-            ),
-            "cwd": workdir,
-            "mode": "yolo",
-            "maxTurns": 10,
-        },
-    }, timeout=600)
-    res = r.get("result") or {}
-    content = res.get("content") or []
-    text = content[0]["text"] if content else ""
-    check("complex isError false", res.get("isError") is False, res)
-    exists = os.path.exists(marker)
-    file_ok = exists and open(marker).read().strip() == "complex-ok"
-    check("file was created with content", file_ok,
-          "marker=%s exists=%s" % (marker, exists))
-    check("task completed token", "DONE_COMPLEX" in text, text[:400])
-
-
-def test_error_handling(c):
-    section("zcode tool: error handling")
-    r = c.request("tools/call", {"name": "zcode", "arguments": {}}, timeout=60)
-    res = r.get("result") or {}
-    check("missing prompt -> isError true", res.get("isError") is True, res)
-    text = (res.get("content") or [{"text": ""}])[0].get("text", "")
-    check("error message mentions prompt", "prompt" in text, text)
-
-    r = c.request("tools/call", {
-        "name": "zcode-reply",
-        "arguments": {"prompt": "hi"},
-    }, timeout=60)
-    res = r.get("result") or {}
-    check("reply without threadId -> isError true", res.get("isError") is True, res)
-
-    r = c.request("tools/call", {"name": "does-not-exist", "arguments": {}}, timeout=30)
-    check("unknown tool -> protocol error", "error" in r, r)
-
-
-def test_concurrency(c):
-    section("concurrency: two parallel zcode sessions")
-    results = [None, None]
-
-    def run(i, tag):
-        try:
-            r = c.request("tools/call", {
-                "name": "zcode",
-                "arguments": {"prompt": "Reply with exactly: PARALLEL_%s_DONE" % tag},
-            }, timeout=300)
-            res = r.get("result") or {}
-            content = res.get("content") or []
-            results[i] = (res.get("isError"), content[0]["text"] if content else "")
-        except Exception as e:  # noqa: BLE001
-            results[i] = ("exception", str(e))
-
-    threads = [threading.Thread(target=run, args=(0, "ONE")),
-               threading.Thread(target=run, args=(1, "TWO"))]
-    t0 = time.time()
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    elapsed = time.time() - t0
-    check("both parallel calls isError false",
-          all(r is not None and r[0] is False for r in results), results)
-    check("both replies correct",
-          all(r[1].find("PARALLEL_") >= 0 and r[1].find("_DONE") >= 0 for r in results if r), results)
-    print("      elapsed: %.1fs" % elapsed)
-
-
-def test_stability(c, n=4):
-    section("stability: %d sequential zcode calls" % n)
-    ok = 0
-    times = []
-    for i in range(n):
-        t0 = time.time()
-        try:
-            r = c.request("tools/call", {
-                "name": "zcode",
-                "arguments": {"prompt": "Reply with exactly: STABLE_%d" % i},
-            }, timeout=300)
-            res = r.get("result") or {}
-            content = res.get("content") or []
-            if res.get("isError") is False and ("STABLE_%d" % i) in (content[0]["text"] if content else ""):
-                ok += 1
-        except Exception as e:  # noqa: BLE001
-            print("      call %d exception: %s" % (i, e))
-        times.append(time.time() - t0)
-    check("all %d stability calls passed" % n, ok == n, "ok=%d/%d" % (ok, n))
-    if times:
-        print("      avg %.1fs, min %.1fs, max %.1fs" % (
-            sum(times) / len(times), min(times), max(times)))
+def wait_terminal(client, run_id, initial, output):
+    state = initial
+    while state["status"] not in {"completed", "failed", "cancelled", "timed_out", "closed"}:
+        state = client.tool("zcode-wait", {
+            "runId": run_id,
+            "afterRevision": state["revision"],
+            "timeoutMs": 10000,
+            "resultChars": 12000,
+        }, timeout=30)
+    output.update(state)
 
 
 def main():
-    fast = "--fast" in sys.argv
-    section("starting zcode-mcp-server")
-    c = McpClient()
+    client = McpClient()
     try:
-        test_handshake(c)
-        thread_id = test_new_session(c)
-        test_reply(c, thread_id)
-        test_complex_task(c)
-        test_error_handling(c)
-        test_concurrency(c)
-        if not fast:
-            test_stability(c, n=4)
-    finally:
-        c.close()
+        initialized = client.request("initialize", {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": {"name": "zcode-live-test", "version": "1"},
+        }, timeout=30)
+        require(initialized.get("result", {}).get("serverInfo", {}).get("version") == "0.3.0", "server version is 0.3.0")
+        listed = client.request("tools/list", {}, timeout=30)
+        names = [item["name"] for item in listed["result"]["tools"]]
+        require(names == EXPECTED_TOOLS, "only the new aggregated tools are exposed", names)
 
-    print("\n==== RESULT: %d passed, %d failed ====" % (PASS, FAIL))
-    for name, detail in FAILURES:
-        print("  FAILED: %s -- %s" % (name, str(detail)[:300]))
-    sys.exit(1 if FAIL else 0)
+        with tempfile.TemporaryDirectory(prefix="zcode-live-permission-") as permission_cwd:
+            permission_run = client.tool("zcode-start", {
+                "prompt": (
+                    "Use the Write tool to create permission-proof.txt in the current "
+                    "working directory with exactly HEADLESS_BUILD_OK followed by a newline. "
+                    "Then reply exactly HEADLESS_BUILD_DONE."
+                ),
+                "cwd": permission_cwd,
+                "mode": "build",
+                "thoughtLevel": "high",
+                "timeout": 180,
+            }, timeout=30)
+            permission_final = {}
+            wait_terminal(client, permission_run["runId"], permission_run, permission_final)
+            require(
+                permission_final.get("status") == "completed",
+                "managed build run completed after headless permission approval",
+                permission_final,
+            )
+            proof_path = os.path.join(permission_cwd, "permission-proof.txt")
+            with open(proof_path, encoding="utf-8") as handle:
+                proof = handle.read()
+            require(proof == "HEADLESS_BUILD_OK\n", "build-mode Write reached the declared worktree", proof)
+            require(
+                "HEADLESS_BUILD_DONE" in permission_final.get("result", ""),
+                "build-mode result is preserved",
+                permission_final,
+            )
+            client.tool("zcode-close", {"runId": permission_run["runId"]}, timeout=30)
+
+        with tempfile.TemporaryDirectory(prefix="zcode-live-goal-") as goal_cwd:
+            goal = client.tool("zcode-start", {
+                "goal": "Reply exactly GOAL_ONLY_DONE and use no tools. The objective is complete after that reply.",
+                "cwd": goal_cwd,
+                "mode": "build",
+                "thoughtLevel": "high",
+                "timeout": 120,
+            }, timeout=30)
+            goal_final = {}
+            wait_terminal(client, goal["runId"], goal, goal_final)
+            require(goal_final.get("status") == "completed", "goal-only run completed", goal_final)
+            require(
+                "GOAL_ONLY_DONE" in goal_final.get("result", ""),
+                "goal-only result is preserved",
+                goal_final,
+            )
+            require("prompt is already running" not in str(goal_final).lower(), "goal-only run has no double-start race")
+            client.tool("zcode-close", {"runId": goal["runId"]}, timeout=30)
+
+        with tempfile.TemporaryDirectory(prefix="zcode-live-a-") as first_cwd, tempfile.TemporaryDirectory(prefix="zcode-live-b-") as second_cwd:
+            prompt_a = "Use the Bash tool to run exactly `sleep 6`. Wait for it to finish, then reply exactly PARALLEL_A_DONE."
+            prompt_b = "Use the Bash tool to run exactly `sleep 6`. Wait for it to finish, then reply exactly PARALLEL_B_DONE."
+            first = client.tool("zcode-start", {
+                "prompt": prompt_a, "cwd": first_cwd, "mode": "yolo", "thoughtLevel": "max"
+            }, timeout=30)
+            second = client.tool("zcode-start", {
+                "prompt": prompt_b, "cwd": second_cwd, "mode": "yolo", "thoughtLevel": "max"
+            }, timeout=30)
+            require(first["runId"] != second["runId"], "independent runs receive distinct IDs")
+
+            first_final, second_final = {}, {}
+            threads = [
+                threading.Thread(target=wait_terminal, args=(client, first["runId"], first, first_final)),
+                threading.Thread(target=wait_terminal, args=(client, second["runId"], second, second_final)),
+            ]
+            for thread in threads:
+                thread.start()
+
+            both_running = False
+            both_bash = False
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline and any(thread.is_alive() for thread in threads):
+                one = client.tool("zcode-observe", {"runId": first["runId"], "refresh": False, "resultChars": 0}, timeout=30)
+                two = client.tool("zcode-observe", {"runId": second["runId"], "refresh": False, "resultChars": 0}, timeout=30)
+                if one["status"] == "running" and two["status"] == "running":
+                    both_running = True
+                one_tools = {item.get("name") for item in one.get("activeTools", [])}
+                two_tools = {item.get("name") for item in two.get("activeTools", [])}
+                if "Bash" in one_tools and "Bash" in two_tools:
+                    both_bash = True
+                if both_bash:
+                    break
+                time.sleep(0.1)
+
+            for thread in threads:
+                thread.join(150)
+            require(not any(thread.is_alive() for thread in threads), "both live runs terminate")
+            require(both_running, "both native sessions are running concurrently")
+            require(both_bash, "both six-second Bash operations overlap")
+            require(first_final.get("status") == "completed", "first run completed", first_final)
+            require(second_final.get("status") == "completed", "second run completed", second_final)
+            require("PARALLEL_A_DONE" in first_final.get("result", ""), "first result is preserved")
+            require("PARALLEL_B_DONE" in second_final.get("result", ""), "second result is preserved")
+            require(first_final["usage"]["reasoningTokens"] >= 0, "reasoning usage is present")
+            require(second_final["usage"]["modelRequests"] >= 1, "model request usage is present")
+            require(first_final["model"].get("thoughtLevel") == "max", "configured max reasoning is preserved")
+
+            client.tool("zcode-close", {"runId": first["runId"]}, timeout=30)
+            client.tool("zcode-close", {"runId": second["runId"]}, timeout=30)
+            print("LIVE_CONCURRENCY_OK")
+        return 0
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print("FAIL", type(exc).__name__, str(exc), file=sys.stderr)
+        raise

@@ -1,90 +1,89 @@
 #!/usr/bin/env python3
-"""Regression tests for Windows Electron subprocess output handling."""
+"""Cross-platform transport and UTF-8 regression tests."""
 
-import json
+import io
 import os
-import sys
+import json
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
 
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-
-import server  # noqa: E402
+import server
+from zcode_protocol import ZCodeProtocolClient, resolve_runtime_model
 
 
-class WindowsStreamNormalizationTest(unittest.TestCase):
-    def _process(self, stdout, stderr, returncode=0):
+class ProtocolTransportTest(unittest.TestCase):
+    @mock.patch("zcode_protocol.subprocess.Popen")
+    def test_app_server_uses_utf8_and_removes_inherited_model_override(self, popen):
         proc = mock.Mock()
-        proc.communicate.return_value = (stdout, stderr)
-        proc.returncode = returncode
-        return proc
-
-    def test_tool_schemas_do_not_expose_model_override(self):
-        self.assertNotIn("model", server.ZCODE_TOOL_SCHEMA["properties"])
-        self.assertNotIn("model", server.ZCODE_REPLY_TOOL_SCHEMA["properties"])
-
-    @mock.patch("server.subprocess.Popen")
-    def test_none_stderr_does_not_break_successful_result(self, popen):
-        expected = {
-            "response": "MCP_ZCODE_OK",
-            "sessionId": "sess_windows_stream_test",
-        }
-        popen.return_value = self._process(json.dumps(expected), None)
-
-        actual = server.run_zcode(
-            "test",
-            zcode_bin="ZCode.exe",
-            zcode_bundle="zcode.cjs",
-        )
-
-        self.assertEqual(actual, expected)
-        self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
-        self.assertEqual(popen.call_args.kwargs["errors"], "replace")
-
-    @mock.patch("server.subprocess.Popen")
-    def test_inherited_model_override_is_removed(self, popen):
-        expected = {
-            "response": "MCP_ZCODE_OK",
-            "sessionId": "sess_default_model_test",
-        }
-        popen.return_value = self._process(json.dumps(expected), "")
+        proc.poll.return_value = None
+        proc.stdin = io.StringIO()
+        proc.stdout = []
+        proc.stderr = []
+        popen.return_value = proc
 
         with mock.patch.dict(os.environ, {"ZCODE_MODEL": "wrong/model"}):
-            actual = server.run_zcode(
-                "test",
-                zcode_bin="ZCode.exe",
-                zcode_bundle="zcode.cjs",
+            client = ZCodeProtocolClient("ZCode.exe", "zcode.cjs")
+            client.start()
+            client.close()
+
+        kwargs = popen.call_args.kwargs
+        self.assertEqual("utf-8", kwargs["encoding"])
+        self.assertEqual("replace", kwargs["errors"])
+        self.assertNotIn("ZCODE_MODEL", kwargs["env"])
+        self.assertEqual("1", kwargs["env"]["ELECTRON_RUN_AS_NODE"])
+        if os.name != "nt":
+            self.assertTrue(kwargs["start_new_session"])
+
+    def test_new_start_schema_exposes_explicit_native_model_ref(self):
+        model = server.ZCODE_START_SCHEMA["properties"]["model"]
+        self.assertEqual(["providerId", "modelId"], model["required"])
+        self.assertFalse(model["additionalProperties"])
+        alternatives = server.ZCODE_START_SCHEMA["oneOf"]
+        self.assertEqual(["prompt"], alternatives[0]["required"])
+        self.assertEqual(["goal"], alternatives[1]["required"])
+        goal_modes = server.ZCODE_START_SCHEMA["allOf"][0]["then"]["properties"]["mode"]["enum"]
+        self.assertNotIn("plan", goal_modes)
+
+    def test_cold_resume_runtime_model_uses_local_secret_and_reasoning_setting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "config.json")
+            database_path = os.path.join(directory, "db.sqlite")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "model": {"main": "deepseek-1/deepseek-v4-flash"},
+                    "provider": {"deepseek-1": {
+                        "name": "DeepSeek", "kind": "openai-compatible",
+                        "options": {"apiKey": "secret", "baseURL": "https://example.invalid"},
+                        "models": {"deepseek-v4-flash": {
+                            "reasoning": {"enabled": True, "variants": ["high", "max"], "defaultVariant": "high"},
+                            "limit": {"context": 1000000, "output": 384000},
+                        }},
+                    }},
+                }, handle)
+            connection = sqlite3.connect(database_path)
+            connection.execute("create table local_setting (key text primary key, value text)")
+            connection.execute("insert into local_setting values ('reasoningLevel', ?)", ('{"level":"max"}',))
+            connection.commit()
+            connection.close()
+
+            runtime = resolve_runtime_model(
+                config_path=config_path, settings_db_path=database_path
             )
 
-        self.assertEqual(actual, expected)
-        self.assertNotIn("ZCODE_MODEL", popen.call_args.kwargs["env"])
-
-    @mock.patch("server.subprocess.Popen")
-    def test_none_stdout_becomes_structured_parse_error(self, popen):
-        popen.return_value = self._process(None, "")
-
-        with self.assertRaises(server.SessionError) as raised:
-            server.run_zcode(
-                "test",
-                zcode_bin="ZCode.exe",
-                zcode_bundle="zcode.cjs",
-            )
-
-        self.assertEqual(raised.exception.code, "parse_error")
+        self.assertEqual({"providerId": "deepseek-1", "modelId": "deepseek-v4-flash"}, runtime["model"])
+        self.assertEqual("max", runtime["thoughtLevel"])
+        self.assertEqual({"source": "inline", "value": "secret"}, runtime["provider"]["apiKey"])
+        self.assertEqual(1000000, runtime["provider"]["models"][0]["contextWindow"])
 
     def test_log_handles_surrogate_without_default_code_page(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "bridge.log")
             with mock.patch.object(server, "STDERR_LOG", path):
                 server._log("invalid surrogate: \udca6")
-
             with open(path, encoding="utf-8") as handle:
                 content = handle.read()
-
         self.assertIn(r"\udca6", content)
 
 
