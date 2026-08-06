@@ -5,3 +5,12 @@ __pycache__/
 # Local backups / runtime artifacts
 *.bak
 *.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+benchmark-results/
+
+# Local credentials
+.env
+.env.*
+!.env.example

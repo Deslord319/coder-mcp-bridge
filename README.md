@@ -1,6 +1,6 @@
-# Coding Agent Bridge
+# Coder MCP Bridge
 
-面向 Codex 的事件驱动 MCP 调度桥，当前可在同一套 `agent-*` 工具后选择：
+面向 Codex 的事件驱动多代理 MCP 调度桥，仓库名为 `coder-mcp-bridge`。当前可在同一套 `agent-*` 工具后选择：
 
 - ZCode：原生 app-server，会话、durable goal、后台任务与精确 reasoning/usage 事件。
 - OpenCode：本地认证 HTTP server + SSE，会话恢复、引导、分支、压缩与权限事件。
@@ -96,6 +96,14 @@ Bridge 只使用 Python 标准库。至少安装一个后端：
 - OpenCode：PATH 中的 `opencode`，或 `OPENCODE_BINARY=/absolute/path/to/opencode`。
 - Pi：PATH 中的 `pi`，或 `PI_BINARY=/absolute/path/to/pi`。Pi 可执行文件所需 Node.js 也必须在 PATH 中。
 
+Pi 应优先使用其自身内置 provider catalog。例如 DeepSeek V4 Flash 的原生模型引用是：
+
+```json
+{"providerId":"deepseek","modelId":"deepseek-v4-flash"}
+```
+
+同时在 Bridge 进程环境提供 `DEEPSEEK_API_KEY`。不要为同一模型重复创建自定义 Pi provider；原生定义已经包含 DeepSeek thinking 协议、1M context、输出限制、缓存价格和 reasoning replay 配置。
+
 探测全部后端：
 
 ```bash
@@ -115,7 +123,7 @@ Pi 默认把 Bridge 会话放在 `~/.pi/agent/bridge-sessions`，可用 `PI_BRID
 直接启动：
 
 ```bash
-python3 /absolute/path/to/codexCtlZcode/server.py
+python3 /absolute/path/to/coder-mcp-bridge/server.py
 ```
 
 Codex `~/.codex/config.toml`：
@@ -123,14 +131,20 @@ Codex `~/.codex/config.toml`：
 ```toml
 [mcp_servers.coding_agent]
 command = "python3"
-args = ["/absolute/path/to/codexCtlZcode/server.py"]
+args = ["/absolute/path/to/coder-mcp-bridge/server.py"]
 
 [mcp_servers.coding_agent.env]
 AGENT_MCP_DEFAULT_BACKEND = "zcode"
 AGENT_MCP_TIMEOUT = "900"
 ```
 
-仓库根部 `plugin.json` 保留现有 ZCode 插件的 `${ZCODE_PLUGIN_ROOT}` 安装约定，同时贡献同一套通用工具目录。
+仓库根部 `plugin.json` 的插件名和 MCP server id 已使用通用的 `coder-mcp-bridge` / `coding-agent` 命名。`${ZCODE_PLUGIN_ROOT}` 仍保留为 ZCode 插件加载器提供的根目录变量；它是加载协议的一部分，不代表 Bridge 只能调度 ZCode。
+
+## 凭据与本地产物
+
+- 不要把 API key 写入仓库文件；通过进程环境或各代理的本机凭据存储提供。
+- `.env*`、`benchmark-results/`、SQLite lease 数据库和日志默认被 `.gitignore` 排除。
+- 提交前建议检查 `git status --short`，并对暂存内容执行密钥扫描。
 
 ## 环境变量
 
