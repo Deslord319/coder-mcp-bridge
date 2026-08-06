@@ -19,8 +19,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER = os.path.join(os.path.dirname(HERE), "server.py")
 EXPECTED_TOOLS = [
-    "zcode-start", "zcode-wait", "zcode-observe", "zcode-control",
-    "zcode-recover", "zcode-branch", "zcode-context", "zcode-close",
+    "agent-config", "agent-start", "agent-wait", "agent-observe", "agent-control",
+    "agent-recover", "agent-branch", "agent-context", "agent-close",
 ]
 
 
@@ -99,7 +99,7 @@ def require(condition, message, detail=None):
 def wait_terminal(client, run_id, initial, output):
     state = initial
     while state["status"] not in {"completed", "failed", "cancelled", "timed_out", "closed"}:
-        state = client.tool("zcode-wait", {
+        state = client.tool("agent-wait", {
             "runId": run_id,
             "afterRevision": state["revision"],
             "timeoutMs": 10000,
@@ -115,13 +115,13 @@ def main():
             "protocolVersion": "2025-03-26", "capabilities": {},
             "clientInfo": {"name": "zcode-live-test", "version": "1"},
         }, timeout=30)
-        require(initialized.get("result", {}).get("serverInfo", {}).get("version") == "0.4.0", "server version is 0.4.0")
+        require(initialized.get("result", {}).get("serverInfo", {}).get("version") == "0.5.0-dev", "server version is 0.5.0-dev")
         listed = client.request("tools/list", {}, timeout=30)
         names = [item["name"] for item in listed["result"]["tools"]]
         require(names == EXPECTED_TOOLS, "only the new aggregated tools are exposed", names)
 
         with tempfile.TemporaryDirectory(prefix="zcode-live-permission-") as permission_cwd:
-            permission_run = client.tool("zcode-start", {
+            permission_run = client.tool("agent-start", {
                 "prompt": (
                     "Use the Write tool to create permission-proof.txt in the current "
                     "working directory with exactly HEADLESS_BUILD_OK followed by a newline. "
@@ -148,10 +148,10 @@ def main():
                 "build-mode result is preserved",
                 permission_final,
             )
-            client.tool("zcode-close", {"runId": permission_run["runId"]}, timeout=30)
+            client.tool("agent-close", {"runId": permission_run["runId"]}, timeout=30)
 
         with tempfile.TemporaryDirectory(prefix="zcode-live-goal-") as goal_cwd:
-            goal = client.tool("zcode-start", {
+            goal = client.tool("agent-start", {
                 "goal": "Reply exactly GOAL_ONLY_DONE and use no tools. The objective is complete after that reply.",
                 "cwd": goal_cwd,
                 "mode": "build",
@@ -167,10 +167,10 @@ def main():
                 goal_final,
             )
             require("prompt is already running" not in str(goal_final).lower(), "goal-only run has no double-start race")
-            client.tool("zcode-close", {"runId": goal["runId"]}, timeout=30)
+            client.tool("agent-close", {"runId": goal["runId"]}, timeout=30)
 
         with tempfile.TemporaryDirectory(prefix="zcode-live-guidance-") as guidance_cwd:
-            guided_run = client.tool("zcode-start", {
+            guided_run = client.tool("agent-start", {
                 "prompt": (
                     "Use the Bash tool to run exactly `sleep 2`. Wait for it, then "
                     "reply exactly GUIDANCE_FIRST."
@@ -180,7 +180,7 @@ def main():
                 "thoughtLevel": "high",
                 "timeout": 120,
             }, timeout=30)
-            guided = client.tool("zcode-control", {
+            guided = client.tool("agent-control", {
                 "runId": guided_run["runId"],
                 "action": "guide",
                 "prompt": "After the current turn, reply exactly GUIDANCE_SECOND and use no tools.",
@@ -198,15 +198,15 @@ def main():
                 "native-ready guidance has no control failure",
                 guided_final,
             )
-            client.tool("zcode-close", {"runId": guided_run["runId"]}, timeout=30)
+            client.tool("agent-close", {"runId": guided_run["runId"]}, timeout=30)
 
         with tempfile.TemporaryDirectory(prefix="zcode-live-a-") as first_cwd, tempfile.TemporaryDirectory(prefix="zcode-live-b-") as second_cwd:
             prompt_a = "Use the Bash tool to run exactly `sleep 6`. Wait for it to finish, then reply exactly PARALLEL_A_DONE."
             prompt_b = "Use the Bash tool to run exactly `sleep 6`. Wait for it to finish, then reply exactly PARALLEL_B_DONE."
-            first = client.tool("zcode-start", {
+            first = client.tool("agent-start", {
                 "prompt": prompt_a, "cwd": first_cwd, "mode": "yolo", "thoughtLevel": "max"
             }, timeout=30)
-            second = client.tool("zcode-start", {
+            second = client.tool("agent-start", {
                 "prompt": prompt_b, "cwd": second_cwd, "mode": "yolo", "thoughtLevel": "max"
             }, timeout=30)
             require(first["runId"] != second["runId"], "independent runs receive distinct IDs")
@@ -223,8 +223,8 @@ def main():
             both_bash = False
             deadline = time.monotonic() + 120
             while time.monotonic() < deadline and any(thread.is_alive() for thread in threads):
-                one = client.tool("zcode-observe", {"runId": first["runId"], "refresh": False, "resultChars": 0}, timeout=30)
-                two = client.tool("zcode-observe", {"runId": second["runId"], "refresh": False, "resultChars": 0}, timeout=30)
+                one = client.tool("agent-observe", {"runId": first["runId"], "refresh": False, "resultChars": 0}, timeout=30)
+                two = client.tool("agent-observe", {"runId": second["runId"], "refresh": False, "resultChars": 0}, timeout=30)
                 if one["status"] == "running" and two["status"] == "running":
                     both_running = True
                 one_tools = {item.get("name") for item in one.get("activeTools", [])}
@@ -248,8 +248,8 @@ def main():
             require(second_final["usage"]["modelRequests"] >= 1, "model request usage is present")
             require(first_final["model"].get("thoughtLevel") == "max", "configured max reasoning is preserved")
 
-            client.tool("zcode-close", {"runId": first["runId"]}, timeout=30)
-            client.tool("zcode-close", {"runId": second["runId"]}, timeout=30)
+            client.tool("agent-close", {"runId": first["runId"]}, timeout=30)
+            client.tool("agent-close", {"runId": second["runId"]}, timeout=30)
             print("LIVE_CONCURRENCY_OK")
         return 0
     finally:

@@ -1,4 +1,4 @@
-"""Cross-process resource leases for local ZCode MCP bridge instances."""
+"""Cross-process resource leases for local coding-agent Bridge instances."""
 
 from __future__ import annotations
 
@@ -53,7 +53,10 @@ class ResourceLeaseStore:
     def __init__(self, path=None, *, owner_id=None, heartbeat_seconds=2.0,
                  stale_seconds=30.0, poll_seconds=0.2):
         default_path = os.path.expanduser("~/.zcode/cli/zcode-mcp-resource-leases.sqlite")
-        self.path = os.path.realpath(path or os.environ.get("ZCODE_MCP_LEASE_DB") or default_path)
+        self.path = os.path.realpath(
+            path or os.environ.get("AGENT_MCP_LEASE_DB")
+            or os.environ.get("ZCODE_MCP_LEASE_DB") or default_path
+        )
         self.owner_id = owner_id or "bridge_%s_%s" % (os.getpid(), uuid.uuid4().hex)
         self.pid = os.getpid()
         self.guard_pid = None
@@ -67,7 +70,7 @@ class ResourceLeaseStore:
         self._initialize()
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
-            name="zcode-resource-lease-heartbeat",
+            name="agent-resource-lease-heartbeat",
             daemon=True,
         )
         self._heartbeat_thread.start()

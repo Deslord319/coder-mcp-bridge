@@ -27,8 +27,9 @@ class McpContractTest(unittest.TestCase):
     def test_only_new_aggregated_tools_are_exposed(self):
         names = [tool["name"] for tool in tool_catalog()]
         self.assertEqual([
-            "zcode-start", "zcode-wait", "zcode-observe", "zcode-control",
-            "zcode-recover", "zcode-branch", "zcode-context", "zcode-close",
+            "agent-config", "agent-start", "agent-wait", "agent-observe",
+            "agent-control", "agent-recover", "agent-branch", "agent-context",
+            "agent-close",
         ], names)
         self.assertNotIn("zcode", names)
         self.assertNotIn("zcode-reply", names)
@@ -38,7 +39,10 @@ class McpContractTest(unittest.TestCase):
 
     def test_schemas_expose_native_scheduling_capabilities(self):
         tools = {tool["name"]: tool for tool in tool_catalog()}
-        start = tools["zcode-start"]["inputSchema"]
+        config = tools["agent-config"]["inputSchema"]
+        self.assertEqual({"get", "set", "reset", "list"}, set(config["properties"]["action"]["enum"]))
+        self.assertEqual({"zcode", "opencode", "pi"}, set(config["properties"]["backend"]["enum"]))
+        start = tools["agent-start"]["inputSchema"]
         self.assertEqual(["prompt"], start["oneOf"][0]["required"])
         self.assertEqual(["goal"], start["oneOf"][1]["required"])
         goal_modes = start["allOf"][0]["then"]["properties"]["mode"]["enum"]
@@ -48,15 +52,15 @@ class McpContractTest(unittest.TestCase):
             self.assertIn(name, start["properties"])
         self.assertIn("headless", start["properties"]["mode"]["description"])
         self.assertIn("Cross-Bridge", start["properties"]["workspaceAccess"]["description"])
-        actions = tools["zcode-control"]["inputSchema"]["properties"]["action"]["enum"]
+        actions = tools["agent-control"]["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(
             {"guide", "interrupt", "cancel", "cancel-background", "pause-goal", "resume-goal"},
             set(actions),
         )
-        controls = tools["zcode-control"]["inputSchema"]["properties"]
+        controls = tools["agent-control"]["inputSchema"]["properties"]
         self.assertIn("ifRevision", controls)
         self.assertIn("ifStatus", controls)
-        targets = tools["zcode-branch"]["inputSchema"]["properties"]["targetKind"]["enum"]
+        targets = tools["agent-branch"]["inputSchema"]["properties"]["targetKind"]["enum"]
         self.assertEqual({"latestCheckpoint", "checkpoint", "message", "turn"}, set(targets))
 
     def test_descriptions_assign_concurrency_and_observation_responsibility(self):
@@ -66,18 +70,18 @@ class McpContractTest(unittest.TestCase):
         self.assertIn("Codex owns global concurrency", descriptions)
         self.assertIn("run concurrently", descriptions)
         self.assertIn("across Bridge processes", descriptions)
-        self.assertIn("zcode-wait instead of polling or sleeping", descriptions)
+        self.assertIn("agent-wait instead of polling or sleeping", descriptions)
         self.assertIn("Native subscriptions and replay", descriptions)
         self.assertIn("model/reasoning activity", descriptions)
         self.assertIn("background task", descriptions)
-        self.assertIn("bridge restart", descriptions)
+        self.assertIn("Bridge restart", descriptions)
         self.assertIn("checkpoint", descriptions)
         self.assertIn("compact", descriptions)
 
     def test_bounded_observation_and_wait_limits_are_schema_enforced(self):
         tools = {tool["name"]: tool for tool in tool_catalog()}
-        observe = tools["zcode-observe"]["inputSchema"]["properties"]
-        wait = tools["zcode-wait"]["inputSchema"]["properties"]
+        observe = tools["agent-observe"]["inputSchema"]["properties"]
+        wait = tools["agent-wait"]["inputSchema"]["properties"]
         self.assertEqual(30, observe["maxEvents"]["maximum"])
         self.assertEqual(12000, observe["resultChars"]["maximum"])
         self.assertEqual(60000, wait["timeoutMs"]["maximum"])

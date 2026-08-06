@@ -1,7 +1,7 @@
 {
   "name": "zcode-mcp-bridge",
-  "version": "0.4.0",
-  "description": "Event-driven ZCode scheduling bridge for Codex: cross-process resource leases, replayable observation, phase-safe control, recovery, branching, context compaction, and verified lifecycle management.",
+  "version": "0.5.0-dev",
+  "description": "Event-driven multi-agent scheduling bridge for Codex with selectable ZCode, OpenCode and Pi backends.",
   "license": "MIT",
   "mcpServers": {
     "zcode-agent": {
@@ -9,7 +9,7 @@
       "command": "python3",
       "args": ["${ZCODE_PLUGIN_ROOT}/server.py"],
       "env": {
-        "ZCODE_MCP_TIMEOUT": "900"
+        "AGENT_MCP_TIMEOUT": "900"
       }
     }
   }

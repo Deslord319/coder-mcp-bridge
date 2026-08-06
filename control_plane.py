@@ -225,14 +225,17 @@ def _structured_paths(value, cwd, parent_key=None):
     return list(dict.fromkeys(paths))
 
 
-def _path_in_roots(path, roots):
-    for root in roots:
+def _path_resource_mode(path, resource_modes):
+    matches = []
+    for root, mode in resource_modes.items():
+        if not os.path.isabs(root):
+            continue
         try:
             if os.path.commonpath([path, root]) == root:
-                return True
+                matches.append((len(root), mode))
         except ValueError:
             continue
-    return False
+    return max(matches)[1] if matches else None
 
 
 class RunRecord:
@@ -380,24 +383,26 @@ class ZCodeControlPlane:
                         "decision": "deny",
                         "reason": "Headless plan-mode runs may not execute approval-gated tools",
                     }
-                allowed_roots = [run.cwd] + [
-                    key for key in run.resource_modes
-                    if os.path.isabs(key) and key != run.cwd
-                ]
                 candidate_paths = _structured_paths(params, run.cwd)
-                outside = [
-                    path for path in candidate_paths
-                    if not _path_in_roots(path, allowed_roots)
-                ]
-                if (run.workspace_access == "shared" and
-                        normalized_tool in _STRUCTURED_WRITE_TOOLS):
+                outside = [path for path in candidate_paths if _path_resource_mode(
+                    path, run.resource_modes
+                ) is None]
+                read_only_paths = [path for path in candidate_paths if _path_resource_mode(
+                    path, run.resource_modes
+                ) != "exclusive"]
+                write_denied = normalized_tool in _STRUCTURED_WRITE_TOOLS and (
+                    bool(read_only_paths)
+                    or (not candidate_paths and run.workspace_access != "exclusive")
+                )
+                if write_denied:
                     self._event(run, "interaction.permission-denied", {
                         "toolName": tool_name,
-                        "reason": "shared workspace is read-only for structured write tools",
+                        "reason": "structured write requires an exclusive declared root",
+                        "paths": read_only_paths[:8],
                     })
                     return {
                         "decision": "deny",
-                        "reason": "Structured writes require workspaceAccess=exclusive",
+                        "reason": "Structured writes require an exclusive declared path root",
                     }
                 if outside:
                     self._event(run, "interaction.permission-denied", {
@@ -2047,6 +2052,10 @@ class ZCodeControlPlane:
                     key for key in run.resource_modes
                     if os.path.isabs(key) and key != run.cwd
                 ],
+                "rootModes": {
+                    key: mode for key, mode in run.resource_modes.items()
+                    if os.path.isabs(key)
+                },
             },
             "subagents": run.subagents,
             "context": run.context,

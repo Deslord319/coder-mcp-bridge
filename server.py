@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""Event-driven ZCode scheduling bridge for MCP clients.
+"""Event-driven ZCode/OpenCode/Pi scheduling bridge for MCP clients.
 
-The bridge uses ZCode's persistent app-server protocol.  It exposes compact
-run state and control operations while keeping raw model streams and native
-session snapshots private.  Codex owns global concurrency; the bridge only
-serializes declared worktree and resource conflicts.
+The bridge keeps each agent's native transport behind one compact run-state
+contract. Codex owns global concurrency; the bridge only serializes declared
+worktree and resource conflicts.
 
 Requirements
 ------------
-* ZCode.app installed at /Applications/ZCode.app (or ZCODE_APP_PATH env override).
-* `~/.zcode/cli/config.json` configured with a model provider (run with
-  `--ensure-config` once to copy the provider from the desktop config).
+* At least one supported backend installed: ZCode, OpenCode or Pi.
+* Provider/model credentials configured in the selected backend itself.
 
 Usage
 -----
   python3 server.py                 # run as an MCP stdio server
-  python3 server.py --ensure-config # one-time setup of ~/.zcode/cli/config.json
-  python3 server.py --probe         # print ZCode discovery info and exit
+  python3 server.py --ensure-config # optional ZCode-only config bootstrap
+  python3 server.py --probe         # print all backend probes and exit
 """
 
 from __future__ import annotations
@@ -28,21 +26,28 @@ import sys
 import threading
 import time
 import traceback
-from control_plane import ControlPlaneError, ZCodeControlPlane
+from backend_manager import BackendManager
+from control_plane import ControlPlaneError
 from zcode_protocol import ProtocolError
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-TIMEOUT_DEFAULT = int(os.environ.get("ZCODE_MCP_TIMEOUT", "900") or 900)      # seconds per tool call
+TIMEOUT_DEFAULT = int(
+    os.environ.get("AGENT_MCP_TIMEOUT") or os.environ.get("ZCODE_MCP_TIMEOUT") or "900"
+)  # seconds per run
 # Zero means the MCP client owns global scheduling. The bridge still serializes
 # conflicting sessions/worktrees/resources; a positive env override is only an
 # optional operator safety cap.
-MAX_CONCURRENCY = int(os.environ.get("ZCODE_MCP_MAX_CONCURRENCY", "0") or 0)
+MAX_CONCURRENCY = int(
+    os.environ.get("AGENT_MCP_MAX_CONCURRENCY")
+    or os.environ.get("ZCODE_MCP_MAX_CONCURRENCY")
+    or "0"
+)
 PROTOCOL_VERSION = "2025-03-26"
-SERVER_VERSION = "0.4.0"
-STDERR_LOG = os.environ.get("ZCODE_MCP_LOG", "")
+SERVER_VERSION = "0.5.0-dev"
+STDERR_LOG = os.environ.get("AGENT_MCP_LOG") or os.environ.get("ZCODE_MCP_LOG", "")
 
 def _log(msg: str) -> None:
     if STDERR_LOG:
@@ -360,22 +365,53 @@ ZCODE_CLOSE_SCHEMA = {
     "additionalProperties": False,
 }
 
+AGENT_CONFIG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["get", "set", "reset", "list"],
+            "default": "get",
+        },
+        "backend": {"type": "string", "enum": ["zcode", "opencode", "pi"]},
+    },
+    "allOf": [{
+        "if": {"properties": {"action": {"const": "set"}}, "required": ["action"]},
+        "then": {"required": ["backend"]},
+    }],
+    "additionalProperties": False,
+}
 
-class ZCodeMcpServer:
-    def __init__(self, zcode_bin, zcode_bundle):
+# Public names are backend-neutral.  The schema retains optional ZCode-only
+# fields so selecting ZCode does not erase its native durable-goal capability;
+# other adapters reject unsupported fields explicitly.
+AGENT_START_SCHEMA = ZCODE_START_SCHEMA
+AGENT_WAIT_SCHEMA = ZCODE_WAIT_SCHEMA
+AGENT_OBSERVE_SCHEMA = ZCODE_OBSERVE_SCHEMA
+AGENT_CONTROL_SCHEMA = ZCODE_CONTROL_SCHEMA
+AGENT_RECOVER_SCHEMA = ZCODE_RECOVER_SCHEMA
+AGENT_BRANCH_SCHEMA = ZCODE_BRANCH_SCHEMA
+AGENT_CONTEXT_SCHEMA = ZCODE_CONTEXT_SCHEMA
+AGENT_CLOSE_SCHEMA = ZCODE_CLOSE_SCHEMA
+
+
+class AgentMcpServer:
+    def __init__(self, zcode_bin=None, zcode_bundle=None, *, manager=None):
         self.zcode_bin = zcode_bin
         self.zcode_bundle = zcode_bundle
         self._write_lock = threading.Lock()
         self._calls = {}  # request_id -> cancellation Event
-        self._control = None
+        self._control = manager
         self._control_lock = threading.Lock()
 
     def _control_plane(self):
         with self._control_lock:
             if self._control is None:
-                self._control = ZCodeControlPlane(
-                    self.zcode_bin,
-                    self.zcode_bundle,
+                discover = discover_zcode
+                if self.zcode_bin and self.zcode_bundle:
+                    discover = lambda: (self.zcode_bin, self.zcode_bundle)
+                self._control = BackendManager(
+                    discover,
                     max_concurrency=MAX_CONCURRENCY,
                     logger=_log,
                 )
@@ -407,8 +443,8 @@ class ZCodeMcpServer:
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {
-                "name": "zcode-mcp-server",
-                "title": "ZCode",
+                "name": "coding-agent-bridge",
+                "title": "Coding Agent Bridge",
                 "version": SERVER_VERSION,
             },
         })
@@ -416,79 +452,90 @@ class ZCodeMcpServer:
     def handle_tools_list(self, request_id):
         tools = [
             {
-                "name": "zcode-start",
-                "title": "Start ZCode Run",
+                "name": "agent-config",
+                "title": "Configure Coding Agent",
                 "description": (
-                    "Start one non-blocking ZCode task using exactly one of prompt (one turn) or goal (durable). "
+                    "Get, select, reset or list the backend for this Codex task. Selection affects future starts "
+                    "only; existing runIds remain bound to their original backend. Set once before a batch."
+                ),
+                "inputSchema": AGENT_CONFIG_SCHEMA,
+                "outputSchema": {"type": "object", "additionalProperties": True},
+            },
+            {
+                "name": "agent-start",
+                "title": "Start Coding-Agent Run",
+                "description": (
+                    "Start one non-blocking task on the backend selected by agent-config. Native durable goal is "
+                    "available only when ZCode is selected. "
                     "Codex owns global concurrency; independent worktrees and resources run concurrently while "
                     "conflicting exclusive resources queue across Bridge processes. Continue "
-                    "with zcode-wait instead of polling or sleeping."
+                    "with agent-wait instead of polling or sleeping."
                 ),
-                "inputSchema": ZCODE_START_SCHEMA,
+                "inputSchema": AGENT_START_SCHEMA,
                 "outputSchema": RUN_OUTPUT_SCHEMA,
             },
             {
-                "name": "zcode-wait",
-                "title": "Wait for ZCode Progress",
+                "name": "agent-wait",
+                "title": "Wait for Agent Progress",
                 "description": (
                     "Preferred progress path. Wait for a meaningful revision or terminal state; pass the "
                     "last revision as afterRevision. Native subscriptions and replay drive revisions; a "
                     "timeout means unchanged state, not failure."
                 ),
-                "inputSchema": ZCODE_WAIT_SCHEMA,
+                "inputSchema": AGENT_WAIT_SCHEMA,
                 "outputSchema": RUN_OUTPUT_SCHEMA,
             },
             {
-                "name": "zcode-observe",
-                "title": "Observe ZCode Run",
+                "name": "agent-observe",
+                "title": "Observe Agent Run",
                 "description": (
                     "Read compact model/reasoning activity, exact usage, background tasks, subagents, context, "
                     "goal, checkpoints and bounded events. Raw streams and full snapshots remain private."
                 ),
-                "inputSchema": ZCODE_OBSERVE_SCHEMA,
+                "inputSchema": AGENT_OBSERVE_SCHEMA,
                 "outputSchema": RUN_OUTPUT_SCHEMA,
             },
             {
-                "name": "zcode-control",
-                "title": "Control ZCode Run",
+                "name": "agent-control",
+                "title": "Control Agent Run",
                 "description": (
                     "Guide after the current turn, interrupt and guide, cancel a run or one native background "
                     "task, and pause/resume a durable goal. Busy guidance retries after native readiness, and a "
                     "control failure never overwrites an already successful turn. Optional ifRevision/ifStatus "
-                    "guards reject stale decisions."
+                    "guards reject stale decisions. For a terminal non-ZCode run, start again with threadId so "
+                    "resource leases are reacquired."
                 ),
-                "inputSchema": ZCODE_CONTROL_SCHEMA,
+                "inputSchema": AGENT_CONTROL_SCHEMA,
                 "outputSchema": RUN_OUTPUT_SCHEMA,
             },
             {
-                "name": "zcode-recover",
-                "title": "Recover ZCode Session",
+                "name": "agent-recover",
+                "title": "Recover Agent Session",
                 "description": (
-                    "List persisted ZCode sessions or adopt one after a bridge restart. Adoption resumes the "
-                    "native session, restores event replay and reacquires declared resource leases."
+                    "List or adopt persisted sessions for the currently selected backend after a Bridge restart."
                 ),
-                "inputSchema": ZCODE_RECOVER_SCHEMA,
+                "inputSchema": AGENT_RECOVER_SCHEMA,
                 "outputSchema": {"type": "object", "additionalProperties": True},
             },
             {
-                "name": "zcode-branch",
-                "title": "Branch ZCode Session",
+                "name": "agent-branch",
+                "title": "Branch Agent Session",
                 "description": "Fork an idle session from a turn, message, workspace checkpoint, or latest checkpoint.",
-                "inputSchema": ZCODE_BRANCH_SCHEMA,
+                "inputSchema": AGENT_BRANCH_SCHEMA,
                 "outputSchema": {"type": "object", "additionalProperties": True},
             },
             {
-                "name": "zcode-context",
+                "name": "agent-context",
                 "title": "Inspect or Compact Context",
                 "description": "Inspect native context/cache pressure or compact an idle session without lowering reasoning quality.",
-                "inputSchema": ZCODE_CONTEXT_SCHEMA,
+                "inputSchema": AGENT_CONTEXT_SCHEMA,
                 "outputSchema": {"type": "object", "additionalProperties": True},
             },
             {
-                "name": "zcode-close",
-                "title": "Close ZCode Session",
-                "description": "Release a terminal ZCode session runtime after results, branching and compaction are no longer needed.",
-                "inputSchema": ZCODE_CLOSE_SCHEMA,
+                "name": "agent-close",
+                "title": "Close Agent Session",
+                "description": "Release a terminal native runtime after results, branching and compaction are no longer needed.",
+                "inputSchema": AGENT_CLOSE_SCHEMA,
                 "outputSchema": {"type": "object", "additionalProperties": True},
             },
         ]
@@ -498,8 +545,8 @@ class ZCodeMcpServer:
         name = params.get("name")
         args = params.get("arguments") or {}
         if name not in {
-            "zcode-start", "zcode-wait", "zcode-observe", "zcode-control",
-            "zcode-recover", "zcode-branch", "zcode-context", "zcode-close",
+            "agent-config", "agent-start", "agent-wait", "agent-observe", "agent-control",
+            "agent-recover", "agent-branch", "agent-context", "agent-close",
         }:
             self.send_error(request_id, -32602, "Unknown tool: %s" % name)
             return
@@ -530,14 +577,14 @@ class ZCodeMcpServer:
             self.send_response(request_id, {
                 "content": [{
                     "type": "text",
-                    "text": "[zcode-error:%s] %s" % (getattr(e, "code", "protocol"), getattr(e, "message", str(e))),
+                    "text": "[agent-error:%s] %s" % (getattr(e, "code", "protocol"), getattr(e, "message", str(e))),
                 }],
                 "isError": True,
             })
         except Exception as e:  # noqa: BLE001
             _log("internal error: %s\n%s" % (e, traceback.format_exc()))
             self.send_response(request_id, {
-                "content": [{"type": "text", "text": "[zcode-internal-error] %s" % e}],
+                "content": [{"type": "text", "text": "[agent-internal-error] %s" % e}],
                 "isError": True,
             })
         finally:
@@ -545,18 +592,20 @@ class ZCodeMcpServer:
 
     def _execute_control(self, name, args):
         control = self._control_plane()
-        if name == "zcode-start":
+        if name == "agent-config":
+            return control.configure(args)
+        if name == "agent-start":
             mapped = dict(args)
             mapped.setdefault("timeout", TIMEOUT_DEFAULT)
             return control.start(mapped)
-        if name == "zcode-wait":
+        if name == "agent-wait":
             return control.wait(
                 args.get("runId", ""),
                 after_revision=args.get("afterRevision", 0),
                 timeout_ms=args.get("timeoutMs", 30000),
                 result_chars=args.get("resultChars", 2000),
             )
-        if name == "zcode-observe":
+        if name == "agent-observe":
             return control.observe(
                 args.get("runId", ""),
                 refresh=args.get("refresh", True),
@@ -564,27 +613,27 @@ class ZCodeMcpServer:
                 max_events=args.get("maxEvents", 12),
                 result_chars=args.get("resultChars", 2000),
             )
-        if name == "zcode-control":
+        if name == "agent-control":
             return control.control(
                 args.get("runId", ""), args.get("action", ""),
                 prompt=args.get("prompt"), task_id=args.get("taskId"),
                 if_revision=args.get("ifRevision"), if_status=args.get("ifStatus"),
             )
-        if name == "zcode-recover":
+        if name == "agent-recover":
             return control.recover(args)
-        if name == "zcode-branch":
+        if name == "agent-branch":
             return control.branch(
                 args.get("runId", ""),
                 target_kind=args.get("targetKind", "latestCheckpoint"),
                 target_id=args.get("targetId"),
                 turn_index=args.get("turnIndex"),
             )
-        if name == "zcode-context":
+        if name == "agent-context":
             return control.context(
                 args.get("runId", ""), action=args.get("action", "inspect"),
                 instructions=args.get("instructions"),
             )
-        if name == "zcode-close":
+        if name == "agent-close":
             return control.close_run(args.get("runId"), thread_id=args.get("threadId"))
         raise ControlPlaneError("unknown control tool: %s" % name, "invalid_params")
 
@@ -624,9 +673,7 @@ class ZCodeMcpServer:
             self.send_error(req_id, -32601, "Method not found: %s" % method)
 
     def serve(self) -> None:
-        _log("starting zcode-mcp-server %s" % SERVER_VERSION)
-        _log("zcode_bin=%s" % self.zcode_bin)
-        _log("zcode_bundle=%s" % self.zcode_bundle)
+        _log("starting coding-agent-bridge %s" % SERVER_VERSION)
         _log("max_concurrency=%s timeout=%s" % (MAX_CONCURRENCY, TIMEOUT_DEFAULT))
         try:
             for line in sys.stdin:
@@ -651,25 +698,22 @@ def main(argv):
     if "--ensure-config" in argv:
         return ensure_cli_config()
     if "--probe" in argv:
+        manager = BackendManager(discover_zcode, max_concurrency=MAX_CONCURRENCY, logger=_log)
         try:
-            binary, bundle = discover_zcode()
-            print("ZCode binary : %s" % binary)
-            print("ZCode bundle : %s" % bundle)
-            print("CLI config   : %s" % os.path.expanduser("~/.zcode/cli/config.json"))
-            return 0
-        except RuntimeError as e:
-            print("error: %s" % e)
-            return 1
-    try:
-        binary, bundle = discover_zcode()
-    except RuntimeError as e:
-        _log("discovery failed: %s" % e)
-        print("[zcode-mcp-server] error: %s" % e, file=sys.stderr)
-        sys.stderr.flush()
-        return 1
-    ZCodeMcpServer(binary, bundle).serve()
+            result = manager.configure({"action": "list"})
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if any(
+                item.get("available") for item in result["availableBackends"].values()
+            ) else 1
+        finally:
+            manager.close()
+    AgentMcpServer().serve()
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
+
+
+# Import compatibility for embedders; the public MCP catalog is agent-* only.
+ZCodeMcpServer = AgentMcpServer

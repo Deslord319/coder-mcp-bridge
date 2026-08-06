@@ -16,7 +16,7 @@ def run_task(client, prompt, cwd, *, thread_id=None):
     args = {"prompt": prompt, "cwd": cwd, "mode": "plan"}
     if thread_id:
         args["threadId"] = thread_id
-    started = client.tool("zcode-start", args, timeout=30)
+    started = client.tool("agent-start", args, timeout=30)
     final = {}
     wait_terminal(client, started["runId"], started, final)
     if final.get("status") != "completed":
@@ -53,7 +53,7 @@ def stability(client, count, root):
         result = run_task(client, "Reply exactly STABLE_%s. Do not use tools." % index, root)
         if "STABLE_%s" % index not in result.get("result", ""):
             raise AssertionError(result)
-        client.tool("zcode-close", {"runId": result["runId"]}, timeout=30)
+        client.tool("agent-close", {"runId": result["runId"]}, timeout=30)
     print("PASS %s sequential lifecycle rounds" % count)
 
 
@@ -73,7 +73,7 @@ def multi_turn(client, turns, root):
             raise AssertionError("resumed run did not report new model usage: %r" % current)
         if current["sessionUsage"]["modelRequests"] <= current["usage"]["modelRequests"]:
             raise AssertionError("session cumulative usage did not preserve prior turns: %r" % current)
-    client.tool("zcode-close", {"runId": current["runId"]}, timeout=30)
+    client.tool("agent-close", {"runId": current["runId"]}, timeout=30)
     print("PASS %s turns reused one native session" % turns)
 
 

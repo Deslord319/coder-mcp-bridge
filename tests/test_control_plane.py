@@ -393,6 +393,31 @@ class ControlPlaneTest(unittest.TestCase):
         )
         self.assertEqual("deny", permission["decision"])
 
+    def test_shared_nested_resource_is_read_only_under_exclusive_workspace(self):
+        run = self.start(
+            "implement", "exclusive-parent", mode="build",
+            resources=[{"key": "/tmp/exclusive-parent/shared", "mode": "shared"}],
+        )
+        session_id = self.session(run["runId"])
+        parent = self.protocol.on_server_request(
+            "interaction/requestPermission",
+            {
+                "sessionId": session_id,
+                "toolName": "Write",
+                "input": {"path": "/tmp/exclusive-parent/app.swift"},
+            },
+        )
+        nested = self.protocol.on_server_request(
+            "interaction/requestPermission",
+            {
+                "sessionId": session_id,
+                "toolName": "Write",
+                "input": {"path": "/tmp/exclusive-parent/shared/generated.swift"},
+            },
+        )
+        self.assertEqual("allow", parent["decision"])
+        self.assertEqual("deny", nested["decision"])
+
     def test_start_requires_exactly_one_prompt_or_goal(self):
         with self.assertRaises(ControlPlaneError):
             self.control.start({"cwd": "/tmp/missing"})
