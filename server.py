@@ -443,8 +443,8 @@ class AgentMcpServer:
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {
-                "name": "coding-agent-bridge",
-                "title": "Coding Agent Bridge",
+                "name": "vibe_bridge",
+                "title": "Vibe Bridge",
                 "version": SERVER_VERSION,
             },
         })
@@ -673,7 +673,7 @@ class AgentMcpServer:
             self.send_error(req_id, -32601, "Method not found: %s" % method)
 
     def serve(self) -> None:
-        _log("starting coding-agent-bridge %s" % SERVER_VERSION)
+        _log("starting vibe_bridge %s" % SERVER_VERSION)
         _log("max_concurrency=%s timeout=%s" % (MAX_CONCURRENCY, TIMEOUT_DEFAULT))
         try:
             for line in sys.stdin:

@@ -123,11 +123,11 @@ Pi 应使用其内置 provider catalog：
 在 Codex 的 `~/.codex/config.toml` 中添加：
 
 ```toml
-[mcp_servers.coding_agent]
+[mcp_servers.vibe_bridge]
 command = "python3"
 args = ["/absolute/path/to/coder-mcp-bridge/server.py"]
 
-[mcp_servers.coding_agent.env]
+[mcp_servers.vibe_bridge.env]
 AGENT_MCP_DEFAULT_BACKEND = "zcode"
 AGENT_MCP_TIMEOUT = "900"
 ```
@@ -138,7 +138,7 @@ AGENT_MCP_TIMEOUT = "900"
 python3 /absolute/path/to/coder-mcp-bridge/server.py
 ```
 
-仓库根目录的 `plugin.json` 使用 `coder-mcp-bridge` / `coding-agent` 通用命名。`${ZCODE_PLUGIN_ROOT}` 是 ZCode 插件加载器提供的根目录变量，保留它不代表 Bridge 只能调度 ZCode。
+仓库根目录的 `plugin.json` 使用项目名 `coder-mcp-bridge` 与 MCP server id `vibe_bridge`。`${ZCODE_PLUGIN_ROOT}` 是 ZCode 插件加载器提供的根目录变量，保留它不代表 Bridge 只能调度 ZCode。
 
 ## MCP 工具
 

@@ -123,11 +123,11 @@ Provide `DEEPSEEK_API_KEY` in the bridge process environment. Do not duplicate t
 Add the bridge to Codex's `~/.codex/config.toml`:
 
 ```toml
-[mcp_servers.coding_agent]
+[mcp_servers.vibe_bridge]
 command = "python3"
 args = ["/absolute/path/to/coder-mcp-bridge/server.py"]
 
-[mcp_servers.coding_agent.env]
+[mcp_servers.vibe_bridge.env]
 AGENT_MCP_DEFAULT_BACKEND = "zcode"
 AGENT_MCP_TIMEOUT = "900"
 ```
@@ -138,7 +138,7 @@ It can also be started directly:
 python3 /absolute/path/to/coder-mcp-bridge/server.py
 ```
 
-The root `plugin.json` uses the generic `coder-mcp-bridge` / `coding-agent` names. `${ZCODE_PLUGIN_ROOT}` remains because it is supplied by the ZCode plugin loader; it does not limit the bridge to ZCode.
+The root `plugin.json` uses `coder-mcp-bridge` as the project name and `vibe_bridge` as the MCP server id. `${ZCODE_PLUGIN_ROOT}` remains because it is supplied by the ZCode plugin loader; it does not limit the bridge to ZCode.
 
 ## MCP Tools
 

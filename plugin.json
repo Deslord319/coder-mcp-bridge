@@ -4,7 +4,7 @@
   "description": "Event-driven multi-agent scheduling bridge for Codex with selectable ZCode, OpenCode and Pi backends.",
   "license": "MIT",
   "mcpServers": {
-    "coding-agent": {
+    "vibe_bridge": {
       "type": "stdio",
       "command": "python3",
       "args": ["${ZCODE_PLUGIN_ROOT}/server.py"],
