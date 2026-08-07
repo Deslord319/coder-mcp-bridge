@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import sys
+import time
 
 
 for raw in sys.stdin.buffer:
@@ -17,6 +18,9 @@ for raw in sys.stdin.buffer:
                 "thinkingLevel": "max",
                 "model": {"provider": "deepseek", "id": "deepseek-v4-flash"},
             }
+        elif kind == "delay":
+            time.sleep(float(command.get("seconds") or 0))
+            data = {"delayed": True}
         else:
             data = {"echo": command.get("value"), "unicode": "left\u2028right"}
         response = {

@@ -4,6 +4,7 @@ import os
 import json
 import sys
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -15,6 +16,27 @@ FAKE_PI = os.path.join(HERE, "fixtures", "fake_pi_rpc.py")
 
 
 class PiRpcTest(unittest.TestCase):
+    def test_background_request_returns_before_delayed_response(self):
+        client = PiRpcClient([sys.executable, FAKE_PI], cwd=HERE)
+        completed = threading.Event()
+        result = {}
+        try:
+            client.start()
+            started = time.monotonic()
+            client.request_background(
+                "delay",
+                {"seconds": 0.5},
+                callback=lambda data, error: (
+                    result.update({"data": data, "error": error}), completed.set()
+                ),
+            )
+            self.assertLess(time.monotonic() - started, 0.25)
+            self.assertTrue(completed.wait(2))
+            self.assertIsNone(result["error"])
+            self.assertTrue(result["data"]["delayed"])
+        finally:
+            client.close()
+
     def test_strict_lf_transport_preserves_unicode_separators_and_concurrency(self):
         client = PiRpcClient([sys.executable, FAKE_PI], cwd=HERE)
         try:
@@ -183,6 +205,93 @@ class PiRpcTest(unittest.TestCase):
         self.assertIs(parent_client, runtime.client)
         self.assertEqual("/sessions/parent.jsonl", result["parentThreadId"])
         self.assertEqual("/sessions/child.jsonl", result["threadId"])
+
+    def test_interrupt_returns_immediately_and_resumes_from_settled_event(self):
+        emitted = []
+        prompt_sent = threading.Event()
+
+        class InterruptClient:
+            def __init__(self):
+                self.abort_callback = None
+                self.prompts = []
+
+            def request_background(self, command, params=None, timeout=30, callback=None):
+                self.abort_callback = callback
+                self.abort_timeout = timeout
+                return "abort-one"
+
+            def request(self, command, params=None, timeout=30):
+                if command == "prompt":
+                    self.prompts.append(params["message"])
+                    prompt_sent.set()
+                return {}
+
+        backend = type("Backend", (), {"logger": lambda *_args: None})()
+        runtime = PiRuntime(backend, {"timeout": 900}, emitted.append, lambda _message: None)
+        client = InterruptClient()
+        runtime.client = client
+
+        started = time.monotonic()
+        runtime.guide("write the final summary", interrupt=True)
+        self.assertLess(time.monotonic() - started, 0.15)
+        self.assertIsNotNone(client.abort_callback)
+
+        # Pi emits agent_settled before its abort RPC response. The first
+        # settled event must continue the interrupted run, not terminate it.
+        runtime._on_event({"type": "agent_settled"})
+        self.assertTrue(prompt_sent.wait(1))
+        self.assertEqual(["write the final summary"], client.prompts)
+        self.assertFalse(any(event.get("type") == "settled" for event in emitted))
+
+        # A later abort response is harmless and cannot submit the prompt twice.
+        client.abort_callback({}, None)
+        time.sleep(0.05)
+        self.assertEqual(["write the final summary"], client.prompts)
+
+    def test_cancel_is_async_and_aborted_message_becomes_cancelled(self):
+        emitted = []
+        settled = threading.Event()
+
+        class CancelClient:
+            background_requests = 0
+
+            def request_background(self, command, params=None, timeout=30, callback=None):
+                self.background_requests += 1
+                self.abort_callback = callback
+                return "abort-cancel"
+
+            def request(self, command, params=None, timeout=30):
+                if command == "get_last_assistant_text":
+                    return {"text": "partial summary"}
+                if command == "get_session_stats":
+                    return {}
+                if command == "get_state":
+                    return {"sessionId": "session-one", "model": {}}
+                if command == "get_messages":
+                    return {"messages": [{"role": "assistant", "stopReason": "aborted"}]}
+                return {}
+
+        def capture(event):
+            emitted.append(event)
+            if event.get("type") == "settled":
+                settled.set()
+
+        backend = type("Backend", (), {"logger": lambda *_args: None})()
+        runtime = PiRuntime(backend, {"timeout": 900}, capture, lambda _message: None)
+        client = CancelClient()
+        runtime.client = client
+
+        started = time.monotonic()
+        runtime.cancel()
+        runtime.cancel()
+        self.assertLess(time.monotonic() - started, 0.15)
+        self.assertEqual(1, client.background_requests)
+        runtime._on_event({"type": "agent_settled"})
+        self.assertTrue(settled.wait(1))
+        self.assertEqual("cancelled", emitted[-1]["status"])
+        client.abort_callback({}, None)
+        time.sleep(0.05)
+        self.assertEqual(1, sum(event.get("type") == "settled" for event in emitted))
 
 
 if __name__ == "__main__":

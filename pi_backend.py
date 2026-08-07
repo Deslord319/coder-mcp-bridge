@@ -68,6 +68,27 @@ class PiRpcClient:
         self.request("get_state", timeout=30)
 
     def request(self, command_type, params=None, timeout=30):
+        request_id, entry = self._begin_request(command_type, params)
+        return self._await_response(request_id, entry, command_type, timeout)
+
+    def request_background(self, command_type, params=None, timeout=30, callback=None):
+        """Send an RPC command now and wait for its response off the caller thread."""
+        request_id, entry = self._begin_request(command_type, params)
+
+        def await_response():
+            try:
+                data = self._await_response(request_id, entry, command_type, timeout)
+            except Exception as exc:  # noqa: BLE001
+                if callback:
+                    callback(None, exc)
+            else:
+                if callback:
+                    callback(data, None)
+
+        threading.Thread(target=await_response, daemon=True).start()
+        return request_id
+
+    def _begin_request(self, command_type, params=None):
         self.start_if_needed()
         request_id = "bridge-" + uuid.uuid4().hex
         event = threading.Event()
@@ -78,7 +99,15 @@ class PiRpcClient:
         payload.update(params or {})
         try:
             self._send(payload)
-            if not event.wait(timeout):
+        except Exception:
+            with self._lock:
+                self._pending.pop(request_id, None)
+            raise
+        return request_id, entry
+
+    def _await_response(self, request_id, entry, command_type, timeout):
+        try:
+            if not entry["event"].wait(timeout):
                 raise ProtocolError("Pi RPC request timed out: %s" % command_type)
             response = entry["response"] or {}
             if not response.get("success", False):
@@ -227,6 +256,10 @@ class PiRuntime:
         self.state = {}
         self._settling = False
         self._closed = False
+        self._control_lock = threading.RLock()
+        self._pending_interrupt = None
+        self._cancel_requested = False
+        self._settled_event_seen = False
 
     def start(self, prompt):
         cwd = os.path.realpath(self.args.get("cwd") or os.getcwd())
@@ -319,15 +352,79 @@ class PiRuntime:
     def guide(self, prompt, *, interrupt=False):
         if not self.client:
             raise ProtocolError("Pi session is not ready")
+        with self._control_lock:
+            if self._cancel_requested:
+                raise ProtocolError("Pi cancellation is already pending")
         if interrupt:
-            self.client.request("abort", timeout=30)
-            self.client.request("prompt", {"message": prompt}, timeout=30)
+            with self._control_lock:
+                if self._pending_interrupt:
+                    raise ProtocolError("Pi interrupt is already pending")
+                token = uuid.uuid4().hex
+                self._pending_interrupt = {"token": token, "prompt": prompt}
+                self._cancel_requested = False
+            self._abort_background(token, "interrupt")
         else:
             self.client.request("follow_up", {"message": prompt}, timeout=30)
 
     def cancel(self):
-        if self.client:
-            self.client.request("abort", timeout=30)
+        if not self.client:
+            return
+        with self._control_lock:
+            if self._cancel_requested:
+                return
+            token = uuid.uuid4().hex
+            self._pending_interrupt = None
+            self._cancel_requested = True
+        self._abort_background(token, "cancel")
+
+    def _abort_background(self, token, action):
+        timeout = max(60, min(int(self.args.get("timeout") or 900), 3600))
+        self.client.request_background(
+            "abort",
+            timeout=timeout,
+            callback=lambda _data, error: self._on_abort_response(token, action, error),
+        )
+
+    def _on_abort_response(self, token, action, error):
+        if error:
+            self.backend.logger("Pi %s abort response failed: %s" % (action, error))
+            return
+        if action == "interrupt":
+            # An already-idle Pi returns from abort without another settled event.
+            self._resume_interrupt(token)
+        else:
+            # Normally agent_settled arrives before the abort response. This is
+            # the fallback for an already-idle session or a missed native event.
+            with self._control_lock:
+                settled_event_seen = self._settled_event_seen
+            if not settled_event_seen:
+                with self._control_lock:
+                    self._settled_event_seen = True
+                self._start_settling()
+
+    def _resume_interrupt(self, token):
+        with self._control_lock:
+            pending = self._pending_interrupt
+            if not pending or pending["token"] != token:
+                return
+            self._pending_interrupt = None
+            prompt = pending["prompt"]
+        threading.Thread(
+            target=self._send_interrupt_prompt, args=(prompt,), daemon=True
+        ).start()
+
+    def _send_interrupt_prompt(self, prompt):
+        try:
+            self.client.request("prompt", {"message": prompt}, timeout=30)
+        except Exception as exc:  # noqa: BLE001
+            self.emit({"type": "settled", "status": "failed", "error": bounded(exc)})
+
+    def _start_settling(self):
+        with self._control_lock:
+            if self._settling:
+                return
+            self._settling = True
+        threading.Thread(target=self._finish_settled, daemon=True).start()
 
     def branch(self, *, target_kind, target_id, turn_index):
         parent_thread = self.state.get("sessionFile") or self.state.get("sessionId")
@@ -416,9 +513,15 @@ class PiRuntime:
             self.emit({"type": "context.compacting", "phase": "compacting"})
         elif kind == "extension_error":
             self.emit({"type": "extension.error", "error": event.get("error")})
-        elif kind == "agent_settled" and not self._settling:
-            self._settling = True
-            threading.Thread(target=self._finish_settled, daemon=True).start()
+        elif kind == "agent_settled":
+            with self._control_lock:
+                pending = self._pending_interrupt
+            if pending:
+                self._resume_interrupt(pending["token"])
+            else:
+                with self._control_lock:
+                    self._settled_event_seen = True
+                self._start_settling()
         else:
             self.emit({"type": "native.%s" % kind, "detail": {}})
 
@@ -428,16 +531,21 @@ class PiRuntime:
             stats = self.client.request("get_session_stats", timeout=30)
             state = self.client.request("get_state", timeout=30)
             messages = self.client.request("get_messages", timeout=30).get("messages") or []
-            failed = False
+            stop_reason = None
             error = None
             for message in reversed(messages):
                 if message.get("role") == "assistant":
-                    failed = message.get("stopReason") in {"error", "aborted"}
+                    stop_reason = message.get("stopReason")
                     error = message.get("errorMessage")
                     break
+            with self._control_lock:
+                cancelled = self._cancel_requested
+            status = "cancelled" if cancelled else (
+                "failed" if stop_reason in {"error", "aborted"} else "completed"
+            )
             self.emit({
                 "type": "settled",
-                "status": "failed" if failed else "completed",
+                "status": status,
                 "result": text,
                 "error": error,
                 "threadId": state.get("sessionFile") or state.get("sessionId"),
@@ -448,7 +556,8 @@ class PiRuntime:
         except Exception as exc:  # noqa: BLE001
             self.emit({"type": "settled", "status": "failed", "error": bounded(exc)})
         finally:
-            self._settling = False
+            with self._control_lock:
+                self._settling = False
 
     @staticmethod
     def _assistant_model(message):
