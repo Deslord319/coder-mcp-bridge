@@ -8,6 +8,15 @@ Current development version: `0.5.0-dev`.
 
 Naming: the project and plugin are named `coder-mcp-bridge`, the MCP server id is `vibe_bridge`, and all public tools use the `agent-*` prefix. The early `zcode` / `zcode-reply` tools are no longer exposed.
 
+## Methodology and Quick Start
+
+Coder MCP Bridge serves as the execution control plane for specification-driven, long-running agent development. The complete method covers PRDs, UX flows, RFCs, stories, separation of responsibilities, externalized backpressure, and independent acceptance:
+
+- [Specification-Driven Development for Long-Running Agents (English)](docs/HARNESS-CONTEXT-ENGINEERING.en.md)
+- [规约驱动的长程 Agent 开发（简体中文）](docs/HARNESS-CONTEXT-ENGINEERING.zh-CN.md)
+
+Chapter 4 provides a workflow-ordered quick start and three short prompts that can be used directly.
+
 ## Highlights
 
 - **Unified control plane** — configure a backend once, then operate ZCode, OpenCode, or Pi through the same MCP tools.

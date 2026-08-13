@@ -8,6 +8,15 @@
 
 名称约定：项目与插件名为 `coder-mcp-bridge`，MCP server id 为 `vibe_bridge`，对外工具统一使用 `agent-*`；早期的 `zcode` / `zcode-reply` 工具已不再公开。
 
+## 方法论与使用指南
+
+Coder MCP Bridge 是规约驱动长程 Agent 开发中的执行控制面。完整方法涵盖 PRD、UX Flow、RFC、Story、职责分离、外置 backpressure 与独立验收：
+
+- [规约驱动的长程 Agent 开发（中文）](docs/HARNESS-CONTEXT-ENGINEERING.zh-CN.md)
+- [Specification-Driven Development for Long-Running Agents (English)](docs/HARNESS-CONTEXT-ENGINEERING.en.md)
+
+文档第 4 章提供按使用顺序组织的快速指南，以及可直接使用的三条短提示词。
+
 ## 核心能力
 
 - **统一控制面**：一次配置后，通过相同 MCP 工具调度 ZCode、OpenCode 或 Pi。
