@@ -21,7 +21,7 @@ def tool_catalog():
 
 
 class McpContractTest(unittest.TestCase):
-    def test_codex_owns_global_concurrency_by_default(self):
+    def test_upstream_orchestrator_owns_global_concurrency_by_default(self):
         self.assertEqual(0, server.MAX_CONCURRENCY)
 
     def test_only_new_aggregated_tools_are_exposed(self):
@@ -67,7 +67,7 @@ class McpContractTest(unittest.TestCase):
         tools = {tool["name"]: tool for tool in tool_catalog()}
         descriptions = " ".join(tool["description"] for tool in tools.values())
         self.assertLess(len(descriptions), 2200)
-        self.assertIn("Codex owns global concurrency", descriptions)
+        self.assertIn("upstream MCP orchestrator owns global concurrency", descriptions)
         self.assertIn("run concurrently", descriptions)
         self.assertIn("across Bridge processes", descriptions)
         self.assertIn("agent-wait instead of polling or sleeping", descriptions)

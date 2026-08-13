@@ -122,10 +122,10 @@ class BlockingProtocol(AutoProtocol):
 
 
 class ControlStressTest(unittest.TestCase):
-    def test_zero_limit_leaves_twenty_independent_runs_to_codex(self):
+    def test_zero_limit_leaves_twenty_independent_runs_to_upstream_orchestrator(self):
         protocol = AutoProtocol(duration=2)
         control = control_for(protocol, max_concurrency=0)
-        runs = [control.start({"prompt": "parallel %s" % index, "cwd": "/tmp/codex-owned-%s" % index})["runId"] for index in range(20)]
+        runs = [control.start({"prompt": "parallel %s" % index, "cwd": "/tmp/orchestrator-owned-%s" % index})["runId"] for index in range(20)]
         self.assertTrue(eventually(lambda: all(control.snapshot(run_id)["status"] == "running" for run_id in runs)))
         self.assertEqual(20, protocol.max_active)
         self.assertEqual([], protocol.resource_violations)

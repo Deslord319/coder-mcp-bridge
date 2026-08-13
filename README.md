@@ -4,12 +4,14 @@
 
 面向 Codex 等 MCP 客户端的事件驱动多编程代理调度桥。Coder MCP Bridge 将 ZCode、OpenCode 与 Pi 映射为一致的 `agent-*` 工具，使上层调度器可以统一启动、观察、引导、恢复和关闭代理任务，同时保留各后端的原生会话与推理能力。
 
-当前版本：`0.5.0-dev`。`0.4.0` 是已发布的 ZCode 单后端里程碑。
+当前开发版本：`0.5.0-dev`。
+
+名称约定：项目与插件名为 `coder-mcp-bridge`，MCP server id 为 `vibe_bridge`，对外工具统一使用 `agent-*`；早期的 `zcode` / `zcode-reply` 工具已不再公开。
 
 ## 核心能力
 
 - **统一控制面**：一次配置后，通过相同 MCP 工具调度 ZCode、OpenCode 或 Pi。
-- **真实并发**：Bridge 默认不限制全局并发；Codex 决定任务拆分和并发数。
+- **真实并发**：Bridge 默认不限制全局并发；MCP 调度器决定任务拆分和并发数。
 - **资源互斥**：跨进程 SQLite lease 协调 worktree、模拟器和构建目录等共享资源。
 - **事件驱动等待**：使用 revision 和最长 60 秒的事件等待替代固定时长轮询。
 - **会话生命周期**：支持恢复、引导、中断、分支、压缩与显式关闭，能力按后端报告。
@@ -19,7 +21,7 @@
 ## 工作方式
 
 ```text
-Codex / MCP Client
+MCP Client / Orchestrator
         │  agent-*
         ▼
 Coder MCP Bridge
@@ -28,7 +30,7 @@ Coder MCP Bridge
         └── Pi JSONL RPC
 ```
 
-Codex 负责全局并发数、任务颗粒度与交付边界。Bridge 不替代上层调度，而是确保独立任务可以并发、冲突资源被正确串行化，并把不同代理的事件转换为稳定的 MCP 状态。
+上层 MCP 调度器（例如 Codex）负责全局并发数、任务颗粒度与交付边界。Bridge 不替代上层调度，而是确保独立任务可以并发、冲突资源被正确串行化，并把不同代理的事件转换为稳定的 MCP 状态。
 
 设置正数 `AGENT_MCP_MAX_CONCURRENCY` 可增加每个后端的操作员安全上限；默认值 `0` 表示不由 Bridge 限制并发。
 
@@ -120,7 +122,7 @@ Pi 应使用其内置 provider catalog：
 
 ## 注册 MCP
 
-在 Codex 的 `~/.codex/config.toml` 中添加：
+Bridge 使用标准 MCP stdio 传输。以 Codex 为例，在 `~/.codex/config.toml` 中添加：
 
 ```toml
 [mcp_servers.vibe_bridge]
@@ -138,7 +140,7 @@ AGENT_MCP_TIMEOUT = "900"
 python3 /absolute/path/to/coder-mcp-bridge/server.py
 ```
 
-仓库根目录的 `plugin.json` 使用项目名 `coder-mcp-bridge` 与 MCP server id `vibe_bridge`。`${ZCODE_PLUGIN_ROOT}` 是 ZCode 插件加载器提供的根目录变量，保留它不代表 Bridge 只能调度 ZCode。
+其他 MCP 客户端使用等价的 stdio server 配置即可。仓库根目录的 `plugin.json` 使用项目名 `coder-mcp-bridge` 与 MCP server id `vibe_bridge`。`${ZCODE_PLUGIN_ROOT}` 是 ZCode 插件加载器提供的根目录变量，保留它不代表 Bridge 只能调度 ZCode。
 
 ## MCP 工具
 
@@ -201,7 +203,7 @@ python3 /absolute/path/to/coder-mcp-bridge/server.py
 |---|---|---|
 | `AGENT_MCP_DEFAULT_BACKEND` | `zcode` | MCP 连接启动时选中的后端 |
 | `AGENT_MCP_TIMEOUT` | `900` | 默认运行超时，单位秒 |
-| `AGENT_MCP_MAX_CONCURRENCY` | `0` | 每后端可选安全上限；0 表示由 Codex 决定 |
+| `AGENT_MCP_MAX_CONCURRENCY` | `0` | 每后端可选安全上限；0 表示由上层 MCP 调度器决定 |
 | `AGENT_MCP_LOG` | 空 | Bridge 诊断日志路径 |
 | `AGENT_MCP_LEASE_DB` | 兼容旧路径 | 跨进程资源 lease SQLite 文件 |
 | `PI_BINARY` | 自动探测 | Pi 可执行文件 |

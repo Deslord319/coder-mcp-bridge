@@ -2,8 +2,8 @@
 """Event-driven ZCode/OpenCode/Pi scheduling bridge for MCP clients.
 
 The bridge keeps each agent's native transport behind one compact run-state
-contract. Codex owns global concurrency; the bridge only serializes declared
-worktree and resource conflicts.
+contract. The upstream MCP orchestrator owns global concurrency; the bridge
+only serializes declared worktree and resource conflicts.
 
 Requirements
 ------------
@@ -247,7 +247,7 @@ ZCODE_START_SCHEMA = {
                 "required": ["key"],
                 "additionalProperties": False,
             },
-            "description": "Additional cross-Bridge conflict domains such as simulator or DerivedData. Absolute path keys also authorize structured writes under that root. Codex owns global concurrency.",
+            "description": "Additional cross-Bridge conflict domains such as simulator or DerivedData. Absolute path keys also authorize structured writes under that root. The upstream MCP orchestrator owns global concurrency.",
         },
         "goal": {
             "type": "string",
@@ -455,7 +455,7 @@ class AgentMcpServer:
                 "name": "agent-config",
                 "title": "Configure Coding Agent",
                 "description": (
-                    "Get, select, reset or list the backend for this Codex task. Selection affects future starts "
+                    "Get, select, reset or list the backend for this MCP connection. Selection affects future starts "
                     "only; existing runIds remain bound to their original backend. Set once before a batch."
                 ),
                 "inputSchema": AGENT_CONFIG_SCHEMA,
@@ -467,7 +467,7 @@ class AgentMcpServer:
                 "description": (
                     "Start one non-blocking task on the backend selected by agent-config. Native durable goal is "
                     "available only when ZCode is selected. "
-                    "Codex owns global concurrency; independent worktrees and resources run concurrently while "
+                    "The upstream MCP orchestrator owns global concurrency; independent worktrees and resources run concurrently while "
                     "conflicting exclusive resources queue across Bridge processes. Continue "
                     "with agent-wait instead of polling or sleeping."
                 ),

@@ -1,7 +1,7 @@
 {
   "name": "coder-mcp-bridge",
   "version": "0.5.0-dev",
-  "description": "Event-driven multi-agent scheduling bridge for Codex with selectable ZCode, OpenCode and Pi backends.",
+  "description": "Event-driven MCP bridge for orchestrating ZCode, OpenCode and Pi through a unified agent toolset.",
   "license": "MIT",
   "mcpServers": {
     "vibe_bridge": {

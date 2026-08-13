@@ -4,12 +4,14 @@ English | [简体中文](README.md)
 
 An event-driven, multi-agent scheduling bridge for Codex and other MCP clients. Coder MCP Bridge maps ZCode, OpenCode, and Pi onto one consistent set of `agent-*` tools, allowing an orchestrator to start, observe, guide, recover, and close coding-agent runs while preserving each backend's native sessions and reasoning capabilities.
 
-Current version: `0.5.0-dev`. Version `0.4.0` remains the released ZCode-only milestone.
+Current development version: `0.5.0-dev`.
+
+Naming: the project and plugin are named `coder-mcp-bridge`, the MCP server id is `vibe_bridge`, and all public tools use the `agent-*` prefix. The early `zcode` / `zcode-reply` tools are no longer exposed.
 
 ## Highlights
 
 - **Unified control plane** — configure a backend once, then operate ZCode, OpenCode, or Pi through the same MCP tools.
-- **Real concurrency** — the bridge imposes no global limit by default; Codex determines task decomposition and concurrency.
+- **Real concurrency** — the bridge imposes no global limit by default; the MCP orchestrator determines task decomposition and concurrency.
 - **Resource coordination** — cross-process SQLite leases serialize conflicting worktrees, simulators, and build directories.
 - **Event-driven waiting** — revision-based waits of up to 60 seconds replace fixed-duration polling.
 - **Session lifecycle** — recovery, guidance, interruption, branching, compaction, and explicit shutdown, subject to backend capabilities.
@@ -19,7 +21,7 @@ Current version: `0.5.0-dev`. Version `0.4.0` remains the released ZCode-only mi
 ## Architecture
 
 ```text
-Codex / MCP Client
+MCP Client / Orchestrator
         │  agent-*
         ▼
 Coder MCP Bridge
@@ -28,9 +30,9 @@ Coder MCP Bridge
         └── Pi JSONL RPC
 ```
 
-Codex owns global concurrency, task granularity, and delivery boundaries. The bridge does not replace orchestration: it makes independent work truly concurrent, serializes genuinely conflicting resources, and projects backend-specific events into stable MCP state.
+The upstream MCP orchestrator, such as Codex, owns global concurrency, task granularity, and delivery boundaries. The bridge does not replace orchestration: it makes independent work truly concurrent, serializes genuinely conflicting resources, and projects backend-specific events into stable MCP state.
 
-A positive `AGENT_MCP_MAX_CONCURRENCY` sets an optional per-backend operator safety limit. Its default value, `0`, leaves concurrency to Codex.
+A positive `AGENT_MCP_MAX_CONCURRENCY` sets an optional per-backend operator safety limit. Its default value, `0`, leaves concurrency to the upstream orchestrator.
 
 ## Supported Backends
 
@@ -120,7 +122,7 @@ Provide `DEEPSEEK_API_KEY` in the bridge process environment. Do not duplicate t
 
 ## MCP Registration
 
-Add the bridge to Codex's `~/.codex/config.toml`:
+The bridge uses standard MCP stdio transport. For Codex, add it to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.vibe_bridge]
@@ -138,7 +140,7 @@ It can also be started directly:
 python3 /absolute/path/to/coder-mcp-bridge/server.py
 ```
 
-The root `plugin.json` uses `coder-mcp-bridge` as the project name and `vibe_bridge` as the MCP server id. `${ZCODE_PLUGIN_ROOT}` remains because it is supplied by the ZCode plugin loader; it does not limit the bridge to ZCode.
+Other MCP clients can use the equivalent stdio server configuration. The root `plugin.json` uses `coder-mcp-bridge` as the project name and `vibe_bridge` as the MCP server id. `${ZCODE_PLUGIN_ROOT}` remains because it is supplied by the ZCode plugin loader; it does not limit the bridge to ZCode.
 
 ## MCP Tools
 
@@ -201,7 +203,7 @@ Absolute-path resources also become structured file-permission roots: `exclusive
 |---|---|---|
 | `AGENT_MCP_DEFAULT_BACKEND` | `zcode` | Backend selected when an MCP connection starts |
 | `AGENT_MCP_TIMEOUT` | `900` | Default run timeout in seconds |
-| `AGENT_MCP_MAX_CONCURRENCY` | `0` | Optional per-backend safety limit; 0 delegates to Codex |
+| `AGENT_MCP_MAX_CONCURRENCY` | `0` | Optional per-backend safety limit; 0 delegates to the upstream MCP orchestrator |
 | `AGENT_MCP_LOG` | empty | Bridge diagnostic log path |
 | `AGENT_MCP_LEASE_DB` | legacy-compatible path | Cross-process resource-lease SQLite database |
 | `PI_BINARY` | auto-detected | Pi executable |
