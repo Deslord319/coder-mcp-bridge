@@ -14,6 +14,7 @@ import uuid
 
 from agent_control_plane import AdapterControlPlane, bounded
 from control_plane import ControlPlaneError
+from model_deployments import ModelDeploymentManager
 from zcode_protocol import ProtocolError
 
 
@@ -260,9 +261,18 @@ class PiRuntime:
         self._pending_interrupt = None
         self._cancel_requested = False
         self._settled_event_seen = False
+        self._deployment_lease = None
 
     def start(self, prompt):
         cwd = os.path.realpath(self.args.get("cwd") or os.getcwd())
+        deployments = getattr(self.backend, "deployments", None)
+        deployment_key = (
+            deployments.configured(self.args.get("model")) if deployments else None
+        )
+        if deployment_key:
+            self.emit({"type": "deployment.starting", "phase": "model-cold-start"})
+            self._deployment_lease = deployments.acquire(self.args.get("model"))
+            self.emit({"type": "deployment.ready", "phase": "starting-runtime"})
         command = self._build_command(cwd, self.args.get("threadId"))
         env = self._build_env(cwd)
         self.client = PiRpcClient(
@@ -282,6 +292,9 @@ class PiRuntime:
         }
         if prompt is not None:
             self.client.request("prompt", {"message": prompt})
+        else:
+            self._hibernate()
+            self._release_deployment()
         return result
 
     def _build_command(self, cwd, thread_id=None):
@@ -455,13 +468,36 @@ class PiRuntime:
             branch_client.close()
 
     def context(self, *, action, instructions=None):
-        if action == "inspect":
-            stats = self.client.request("get_session_stats", timeout=30)
-            return {"context": self._context(stats), "usage": self._usage(stats)}
-        if action != "compact":
+        if action not in {"inspect", "compact"}:
             raise ControlPlaneError("context action must be inspect or compact", "invalid_params")
-        params = {"customInstructions": instructions} if instructions else None
-        data = self.client.request("compact", params, timeout=180)
+        deployments = getattr(self.backend, "deployments", None)
+        lease = deployments.acquire(self.args.get("model")) if deployments else None
+        client = self.client
+        temporary = None
+        try:
+            if client is None:
+                parent_thread = self.state.get("sessionFile") or self.state.get("sessionId")
+                if not parent_thread:
+                    raise ProtocolError("Pi session is not ready")
+                cwd = os.path.realpath(self.args.get("cwd") or os.getcwd())
+                temporary = PiRpcClient(
+                    self._build_command(cwd, parent_thread),
+                    cwd=cwd,
+                    env=self._build_env(cwd),
+                    logger=self.backend.logger,
+                )
+                temporary.start()
+                client = temporary
+            if action == "inspect":
+                stats = client.request("get_session_stats", timeout=30)
+                return {"context": self._context(stats), "usage": self._usage(stats)}
+            params = {"customInstructions": instructions} if instructions else None
+            data = client.request("compact", params, timeout=180)
+        finally:
+            if temporary:
+                temporary.close()
+            if lease:
+                lease.release()
         return {
             "context": {
                 "tokensBefore": data.get("tokensBefore"),
@@ -472,8 +508,22 @@ class PiRuntime:
 
     def close(self):
         self._closed = True
-        if self.client:
-            self.client.close()
+        self._hibernate()
+        self._release_deployment()
+
+    def _hibernate(self):
+        """Drop the live Pi RPC process while retaining its durable session."""
+        with self._control_lock:
+            client = self.client
+            self.client = None
+        if client:
+            client.close()
+
+    def _release_deployment(self):
+        lease = self._deployment_lease
+        self._deployment_lease = None
+        if lease:
+            lease.release()
 
     def _on_event(self, event):
         kind = event.get("type")
@@ -558,6 +608,8 @@ class PiRuntime:
         finally:
             with self._control_lock:
                 self._settling = False
+            self._hibernate()
+            self._release_deployment()
 
     @staticmethod
     def _assistant_model(message):
@@ -619,7 +671,8 @@ class PiRuntime:
 class PiBackend:
     name = "pi"
 
-    def __init__(self, binary=None, *, session_dir=None, policy_extension=None, logger=None):
+    def __init__(self, binary=None, *, session_dir=None, policy_extension=None,
+                 deployments=None, logger=None):
         self.binary = binary
         self.session_dir = os.path.realpath(
             session_dir or os.environ.get("PI_BRIDGE_SESSION_DIR")
@@ -629,6 +682,7 @@ class PiBackend:
             policy_extension or os.path.join(os.path.dirname(__file__), "pi_bridge_extension.mjs")
         )
         self.logger = logger or (lambda _message: None)
+        self.deployments = deployments or ModelDeploymentManager(logger=self.logger)
 
     @property
     def capabilities(self):
@@ -684,7 +738,7 @@ class PiBackend:
         return result
 
     def close(self):
-        return None
+        self.deployments.close()
 
     def control_plane(self, *, max_concurrency=0, logger=None):
         return AdapterControlPlane(

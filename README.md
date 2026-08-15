@@ -24,6 +24,7 @@ Coder MCP Bridge 是规约驱动长程 Agent 开发中的执行控制面。完�
 - **资源互斥**：跨进程 SQLite lease 协调 worktree、模拟器和构建目录等共享资源。
 - **事件驱动等待**：使用 revision 和最长 60 秒的事件等待替代固定时长轮询。
 - **会话生命周期**：支持恢复、引导、中断、分支、压缩与显式关闭，能力按后端报告。
+- **终态进程休眠**：Pi 任务结束后立即释放 RPC 子进程；分支或压缩时从持久会话临时恢复。
 - **权限投影**：把 MCP 工作区和资源声明转换为各代理可执行的权限策略。
 - **运行可观测性**：统一暴露 reasoning、工具事件、Token、上下文和终态。
 
@@ -129,6 +130,32 @@ Pi 应使用其内置 provider catalog：
 
 同时在 Bridge 进程环境中设置 `DEEPSEEK_API_KEY`。不要为同一模型重复创建自定义 Pi provider；原生定义包含 DeepSeek thinking 协议、1M context、输出限制、缓存价格和 reasoning replay 配置。
 
+### Pi 本地模型按需启停
+
+Bridge 可以在 Pi 任务选择指定的本地 provider/model 时冷启动模型服务，并在最后一个任务结束、超过空闲时间后停止服务。远程 API provider 和未配置的模型完全不受影响。默认读取
+`~/.config/coder-mcp-bridge/model-deployments.json`；也可用
+`PI_MODEL_DEPLOYMENTS_FILE` 指向其他文件。
+
+```json
+{
+  "deployments": {
+    "local-provider/local-model": {
+      "start": ["docker", "compose", "--file", "/absolute/compose.yaml", "--profile", "manual", "up", "-d", "model-service"],
+      "stop": ["docker", "compose", "--file", "/absolute/compose.yaml", "stop", "model-service"],
+      "healthUrl": "http://127.0.0.1:8002/health",
+      "startupTimeoutSeconds": 1800,
+      "idleTimeoutSeconds": 600,
+      "commandTimeoutSeconds": 180,
+      "stopOnBridgeExit": true
+    }
+  }
+}
+```
+
+`start` 和 `stop` 必须是 argv 数组，Bridge 不通过 shell 执行它们。`agent-start`
+仍会立即返回；对应 run 在模型健康前保持 `starting`，并报告
+`deployment.starting` / `deployment.ready` 事件。并发任务通过跨进程共享租约协调，即使来自不同 Bridge 进程，也只有最后一个任务结束后才开始空闲倒计时。Pi 调用本地模型时应显式传入匹配的 `model.providerId` 和 `model.modelId`，以便 Bridge 在启动 Pi 之前识别部署。
+
 ## 注册 MCP
 
 Bridge 使用标准 MCP stdio 传输。以 Codex 为例，在 `~/.codex/config.toml` 中添加：
@@ -217,6 +244,7 @@ python3 /absolute/path/to/coder-mcp-bridge/server.py
 | `AGENT_MCP_LEASE_DB` | 兼容旧路径 | 跨进程资源 lease SQLite 文件 |
 | `PI_BINARY` | 自动探测 | Pi 可执行文件 |
 | `PI_BRIDGE_SESSION_DIR` | `~/.pi/agent/bridge-sessions` | Pi 持久会话目录 |
+| `PI_MODEL_DEPLOYMENTS_FILE` | `~/.config/coder-mcp-bridge/model-deployments.json` | Pi 本地模型按需启停映射；文件不存在时禁用 |
 | `OPENCODE_BINARY` | 自动探测 | OpenCode 可执行文件 |
 
 旧的 `ZCODE_MCP_TIMEOUT`、`ZCODE_MCP_MAX_CONCURRENCY`、`ZCODE_MCP_LOG` 和 `ZCODE_MCP_LEASE_DB` 仍作为兼容别名保留。

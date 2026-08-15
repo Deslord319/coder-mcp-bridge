@@ -14,3 +14,4 @@ benchmark-results/
 .env
 .env.*
 !.env.example
+model-deployments.json

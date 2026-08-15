@@ -24,6 +24,7 @@ Chapter 4 provides a workflow-ordered quick start and three short prompts that c
 - **Resource coordination** — cross-process SQLite leases serialize conflicting worktrees, simulators, and build directories.
 - **Event-driven waiting** — revision-based waits of up to 60 seconds replace fixed-duration polling.
 - **Session lifecycle** — recovery, guidance, interruption, branching, compaction, and explicit shutdown, subject to backend capabilities.
+- **Terminal process hibernation** — Pi releases its RPC child as soon as a run settles and temporarily resumes the durable session for branch or compact operations.
 - **Permission projection** — MCP workspace and resource declarations become enforceable backend policies.
 - **Observability** — reasoning, tool events, token usage, context, and terminal state are exposed consistently.
 
@@ -129,6 +130,28 @@ Use Pi's built-in provider catalog:
 
 Provide `DEEPSEEK_API_KEY` in the bridge process environment. Do not duplicate the same model as a custom Pi provider: the native definition includes the DeepSeek thinking protocol, 1M context, output limits, cache pricing, and reasoning-replay configuration.
 
+### On-demand local models for Pi
+
+The Bridge can cold-start a local model service when a Pi run selects a configured provider/model pair, then stop it after the last run has been idle for a configured period. Remote providers and unconfigured models are unaffected. The default configuration path is `~/.config/coder-mcp-bridge/model-deployments.json`; set `PI_MODEL_DEPLOYMENTS_FILE` to override it.
+
+```json
+{
+  "deployments": {
+    "local-provider/local-model": {
+      "start": ["docker", "compose", "--file", "/absolute/compose.yaml", "--profile", "manual", "up", "-d", "model-service"],
+      "stop": ["docker", "compose", "--file", "/absolute/compose.yaml", "stop", "model-service"],
+      "healthUrl": "http://127.0.0.1:8002/health",
+      "startupTimeoutSeconds": 1800,
+      "idleTimeoutSeconds": 600,
+      "commandTimeoutSeconds": 180,
+      "stopOnBridgeExit": true
+    }
+  }
+}
+```
+
+`start` and `stop` are argv arrays and are never evaluated by a shell. `agent-start` remains non-blocking; the run stays in `starting` until the health check passes and emits `deployment.starting` / `deployment.ready` events. Concurrent runs use cross-process shared leases, so even separate Bridge processes begin the idle timer only after the last run settles. Pass an explicit Pi `model.providerId` and `model.modelId` so the Bridge can identify the deployment before starting Pi.
+
 ## MCP Registration
 
 The bridge uses standard MCP stdio transport. For Codex, add it to `~/.codex/config.toml`:
@@ -217,6 +240,7 @@ Absolute-path resources also become structured file-permission roots: `exclusive
 | `AGENT_MCP_LEASE_DB` | legacy-compatible path | Cross-process resource-lease SQLite database |
 | `PI_BINARY` | auto-detected | Pi executable |
 | `PI_BRIDGE_SESSION_DIR` | `~/.pi/agent/bridge-sessions` | Pi persistent-session directory |
+| `PI_MODEL_DEPLOYMENTS_FILE` | `~/.config/coder-mcp-bridge/model-deployments.json` | On-demand Pi model deployment map; disabled when absent |
 | `OPENCODE_BINARY` | auto-detected | OpenCode executable |
 
 `ZCODE_MCP_TIMEOUT`, `ZCODE_MCP_MAX_CONCURRENCY`, `ZCODE_MCP_LOG`, and `ZCODE_MCP_LEASE_DB` remain supported as compatibility aliases.

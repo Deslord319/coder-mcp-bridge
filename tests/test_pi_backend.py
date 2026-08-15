@@ -254,6 +254,7 @@ class PiRpcTest(unittest.TestCase):
 
         class CancelClient:
             background_requests = 0
+            closed = False
 
             def request_background(self, command, params=None, timeout=30, callback=None):
                 self.background_requests += 1
@@ -270,6 +271,9 @@ class PiRpcTest(unittest.TestCase):
                 if command == "get_messages":
                     return {"messages": [{"role": "assistant", "stopReason": "aborted"}]}
                 return {}
+
+            def close(self):
+                self.closed = True
 
         def capture(event):
             emitted.append(event)
@@ -289,9 +293,57 @@ class PiRpcTest(unittest.TestCase):
         runtime._on_event({"type": "agent_settled"})
         self.assertTrue(settled.wait(1))
         self.assertEqual("cancelled", emitted[-1]["status"])
+        self.assertTrue(client.closed)
+        self.assertIsNone(runtime.client)
         client.abort_callback({}, None)
         time.sleep(0.05)
         self.assertEqual(1, sum(event.get("type") == "settled" for event in emitted))
+
+    def test_context_temporarily_resumes_a_hibernated_session(self):
+        created = []
+
+        class ContextClient:
+            def __init__(self, command, **_kwargs):
+                self.command = command
+                self.closed = False
+                created.append(self)
+
+            def start(self):
+                return None
+
+            def request(self, command, params=None, timeout=30):
+                if command == "get_state":
+                    return {"sessionFile": "/sessions/parent.jsonl"}
+                if command == "get_session_stats":
+                    return {
+                        "tokens": {"total": 12},
+                        "contextUsage": {"tokens": 12, "contextWindow": 100},
+                    }
+                return {}
+
+            def close(self):
+                self.closed = True
+
+        backend = type(
+            "Backend",
+            (),
+            {
+                "binary": "/fake/pi",
+                "session_dir": "/tmp/pi-sessions",
+                "policy_extension": "/bridge/pi-policy.mjs",
+                "logger": lambda *_args: None,
+            },
+        )()
+        runtime = PiRuntime(backend, {"cwd": "/tmp"}, lambda _event: None, lambda _message: None)
+        runtime.state = {"sessionFile": "/sessions/parent.jsonl"}
+        self.assertIsNone(runtime.client)
+        with mock.patch("pi_backend.PiRpcClient", ContextClient):
+            result = runtime.context(action="inspect")
+        self.assertEqual(12, result["usage"]["totalTokens"])
+        self.assertEqual(12, result["context"]["used"])
+        self.assertIn("/sessions/parent.jsonl", created[0].command)
+        self.assertTrue(created[0].closed)
+        self.assertIsNone(runtime.client)
 
 
 if __name__ == "__main__":
